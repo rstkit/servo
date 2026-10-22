@@ -2,43 +2,48 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
-use std::error::Error;
-use std::net::TcpStream;
+#![expect(dead_code)]
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use base::id::PipelineId;
+use atomic_refcell::AtomicRefCell;
 use devtools_traits::DevtoolScriptControlMsg::{DropTimelineMarkers, SetTimelineMarkers};
-use devtools_traits::{DevtoolScriptControlMsg, PreciseTime, TimelineMarker, TimelineMarkerType};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use devtools_traits::{DevtoolScriptControlMsg, TimelineMarker, TimelineMarkerType};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+use servo_base::id::PipelineId;
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::StreamId;
+use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::framerate::FramerateActor;
 use crate::actors::memory::{MemoryActor, TimelineMemoryReply};
-use crate::protocol::JsonPacketStream;
-use crate::StreamId;
+use crate::protocol::{ClientRequest, DevtoolsConnection, JsonPacketStream};
 
-pub struct TimelineActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct TimelineActor {
     name: String,
-    script_sender: IpcSender<DevtoolScriptControlMsg>,
+    script_sender: GenericSender<DevtoolScriptControlMsg>,
     marker_types: Vec<TimelineMarkerType>,
-    pipeline: PipelineId,
+    pipeline_id: PipelineId,
+    #[conditional_malloc_size_of]
     is_recording: Arc<Mutex<bool>>,
-    stream: RefCell<Option<TcpStream>>,
-
-    framerate_actor: RefCell<Option<String>>,
-    memory_actor: RefCell<Option<String>>,
+    framerate_actor: AtomicRefCell<Option<String>>,
+    memory_actor: AtomicRefCell<Option<String>>,
+    #[conditional_malloc_size_of]
+    registry: Arc<Mutex<ActorRegistry>>,
+    start_stamp: CrossProcessInstant,
 }
 
 struct Emitter {
     from: String,
-    stream: TcpStream,
+    stream: DevtoolsConnection,
     registry: Arc<Mutex<ActorRegistry>>,
-    start_stamp: PreciseTime,
+    start_stamp: CrossProcessInstant,
 
     framerate_actor: Option<String>,
     memory_actor: Option<String>,
@@ -63,21 +68,23 @@ struct StopReply {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TimelineMarkerReply {
     name: String,
     start: HighResolutionStamp,
     end: HighResolutionStamp,
     stack: Option<Vec<()>>,
-    endStack: Option<Vec<()>>,
+    end_stack: Option<Vec<()>>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MarkersEmitterReply {
     #[serde(rename = "type")]
     type_: String,
     markers: Vec<TimelineMarkerReply>,
     from: String,
-    endTime: HighResolutionStamp,
+    end_time: HighResolutionStamp,
 }
 
 #[derive(Serialize)]
@@ -102,11 +109,12 @@ struct FramerateEmitterReply {
 /// with accuracy to microsecond that shows how much time has passed since
 /// actor registry inited
 /// analog <https://w3c.github.io/hr-time/#sec-DOMHighResTimeStamp>
-pub struct HighResolutionStamp(f64);
+#[derive(MallocSizeOf)]
+pub(crate) struct HighResolutionStamp(f64);
 
 impl HighResolutionStamp {
-    pub fn new(start_stamp: PreciseTime, time: PreciseTime) -> HighResolutionStamp {
-        let duration = start_stamp.to(time).as_micros();
+    pub fn new(start_stamp: CrossProcessInstant, time: CrossProcessInstant) -> HighResolutionStamp {
+        let duration = (time - start_stamp).whole_microseconds();
         HighResolutionStamp(duration as f64 / 1000_f64)
     }
 
@@ -121,32 +129,33 @@ impl Serialize for HighResolutionStamp {
     }
 }
 
-static DEFAULT_TIMELINE_DATA_PULL_TIMEOUT: u64 = 200; //ms
+static DEFAULT_TIMELINE_DATA_PULL_TIMEOUT: u64 = 200; // ms
 
 impl TimelineActor {
     pub fn new(
         name: String,
-        pipeline: PipelineId,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        pipeline_id: PipelineId,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
+        registry: Arc<Mutex<ActorRegistry>>,
     ) -> TimelineActor {
         let marker_types = vec![TimelineMarkerType::Reflow, TimelineMarkerType::DOMEvent];
 
         TimelineActor {
             name,
-            pipeline,
+            pipeline_id,
             marker_types,
             script_sender,
             is_recording: Arc::new(Mutex::new(false)),
-            stream: RefCell::new(None),
-
-            framerate_actor: RefCell::new(None),
-            memory_actor: RefCell::new(None),
+            framerate_actor: AtomicRefCell::new(None),
+            memory_actor: AtomicRefCell::new(None),
+            start_stamp: CrossProcessInstant::now(),
+            registry,
         }
     }
 
     fn pull_timeline_data(
         &self,
-        receiver: IpcReceiver<Option<TimelineMarker>>,
+        receiver: GenericReceiver<Option<TimelineMarker>>,
         mut emitter: Emitter,
     ) {
         let is_recording = self.is_recording.clone();
@@ -157,78 +166,77 @@ impl TimelineActor {
 
         thread::Builder::new()
             .name("PullTimelineData".to_owned())
-            .spawn(move || loop {
-                if !*is_recording.lock().unwrap() {
-                    break;
-                }
+            .spawn(move || {
+                loop {
+                    if !*is_recording.lock().unwrap() {
+                        break;
+                    }
 
-                let mut markers = vec![];
-                while let Ok(Some(marker)) = receiver.try_recv() {
-                    markers.push(emitter.marker(marker));
-                }
-                if emitter.send(markers).is_err() {
-                    break;
-                }
+                    let mut markers = vec![];
+                    while let Ok(Some(marker)) = receiver.try_recv() {
+                        markers.push(emitter.marker(marker));
+                    }
+                    if emitter.send(markers).is_err() {
+                        break;
+                    }
 
-                thread::sleep(Duration::from_millis(DEFAULT_TIMELINE_DATA_PULL_TIMEOUT));
+                    thread::sleep(Duration::from_millis(DEFAULT_TIMELINE_DATA_PULL_TIMEOUT));
+                }
             })
             .expect("Thread spawning failed");
     }
 }
 
 impl Actor for TimelineActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "start" => {
                 **self.is_recording.lock().as_mut().unwrap() = true;
 
-                let (tx, rx) = ipc::channel::<Option<TimelineMarker>>().unwrap();
+                let (tx, rx) = generic_channel::channel::<Option<TimelineMarker>>().unwrap();
                 self.script_sender
                     .send(SetTimelineMarkers(
-                        self.pipeline,
+                        self.pipeline_id,
                         self.marker_types.clone(),
                         tx,
                     ))
                     .unwrap();
 
-                //TODO: support multiple connections by using root actor's streams instead.
-                *self.stream.borrow_mut() = stream.try_clone().ok();
-
                 // init memory actor
-                if let Some(with_memory) = msg.get("withMemory") {
-                    if let Some(true) = with_memory.as_bool() {
-                        *self.memory_actor.borrow_mut() = Some(MemoryActor::create(registry));
-                    }
+                if let Some(with_memory) = msg.get("withMemory") &&
+                    let Some(true) = with_memory.as_bool()
+                {
+                    *self.memory_actor.borrow_mut() = Some(MemoryActor::create(registry));
                 }
 
                 // init framerate actor
-                if let Some(with_ticks) = msg.get("withTicks") {
-                    if let Some(true) = with_ticks.as_bool() {
-                        let framerate_actor = Some(FramerateActor::create(
-                            registry,
-                            self.pipeline,
-                            self.script_sender.clone(),
-                        ));
-                        *self.framerate_actor.borrow_mut() = framerate_actor;
-                    }
+                if let Some(with_ticks) = msg.get("withTicks") &&
+                    let Some(true) = with_ticks.as_bool()
+                {
+                    let framerate_actor = Some(FramerateActor::create(
+                        registry,
+                        self.pipeline_id,
+                        self.script_sender.clone(),
+                    ));
+                    *self.framerate_actor.borrow_mut() = framerate_actor;
                 }
 
                 let emitter = Emitter::new(
-                    self.name(),
-                    registry.shareable(),
-                    registry.start_stamp(),
-                    stream.try_clone().unwrap(),
+                    self.name().into(),
+                    self.registry.clone(),
+                    self.start_stamp,
+                    request.stream(),
                     self.memory_actor.borrow().clone(),
                     self.framerate_actor.borrow().clone(),
                 );
@@ -236,53 +244,50 @@ impl Actor for TimelineActor {
                 self.pull_timeline_data(rx, emitter);
 
                 let msg = StartReply {
-                    from: self.name(),
-                    value: HighResolutionStamp::new(registry.start_stamp(), PreciseTime::now()),
+                    from: self.name().into(),
+                    value: HighResolutionStamp::new(self.start_stamp, CrossProcessInstant::now()),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "stop" => {
                 let msg = StopReply {
-                    from: self.name(),
-                    value: HighResolutionStamp::new(registry.start_stamp(), PreciseTime::now()),
+                    from: self.name().into(),
+                    value: HighResolutionStamp::new(self.start_stamp, CrossProcessInstant::now()),
                 };
 
-                let _ = stream.write_json_packet(&msg);
                 self.script_sender
                     .send(DropTimelineMarkers(
-                        self.pipeline,
+                        self.pipeline_id,
                         self.marker_types.clone(),
                     ))
                     .unwrap();
 
-                //TODO: move this to the cleanup method.
+                // TODO: move this to the cleanup method.
                 if let Some(ref actor_name) = *self.framerate_actor.borrow() {
-                    registry.drop_actor_later(actor_name.clone());
+                    registry.remove(actor_name.clone());
                 }
 
                 if let Some(ref actor_name) = *self.memory_actor.borrow() {
-                    registry.drop_actor_later(actor_name.clone());
+                    registry.remove(actor_name.clone());
                 }
 
                 **self.is_recording.lock().as_mut().unwrap() = false;
-                self.stream.borrow_mut().take();
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "isRecording" => {
                 let msg = IsRecordingReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     value: *self.is_recording.lock().unwrap(),
                 };
 
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
@@ -290,8 +295,8 @@ impl Emitter {
     pub fn new(
         name: String,
         registry: Arc<Mutex<ActorRegistry>>,
-        start_stamp: PreciseTime,
-        stream: TcpStream,
+        start_stamp: CrossProcessInstant,
+        stream: DevtoolsConnection,
         memory_actor_name: Option<String>,
         framerate_actor_name: Option<String>,
     ) -> Emitter {
@@ -312,43 +317,43 @@ impl Emitter {
             start: HighResolutionStamp::new(self.start_stamp, payload.start_time),
             end: HighResolutionStamp::new(self.start_stamp, payload.end_time),
             stack: payload.start_stack,
-            endStack: payload.end_stack,
+            end_stack: payload.end_stack,
         }
     }
 
-    fn send(&mut self, markers: Vec<TimelineMarkerReply>) -> Result<(), Box<dyn Error>> {
-        let end_time = PreciseTime::now();
+    fn send(&mut self, markers: Vec<TimelineMarkerReply>) -> Result<(), ActorError> {
+        let end_time = CrossProcessInstant::now();
         let reply = MarkersEmitterReply {
             type_: "markers".to_owned(),
             markers,
             from: self.from.clone(),
-            endTime: HighResolutionStamp::new(self.start_stamp, end_time),
+            end_time: HighResolutionStamp::new(self.start_stamp, end_time),
         };
         self.stream.write_json_packet(&reply)?;
 
         if let Some(ref actor_name) = self.framerate_actor {
             let mut lock = self.registry.lock();
             let registry = lock.as_mut().unwrap();
-            let framerate_actor = registry.find_mut::<FramerateActor>(actor_name);
-            let framerateReply = FramerateEmitterReply {
+            let framerate_actor = registry.find::<FramerateActor>(actor_name);
+            let framerate_reply = FramerateEmitterReply {
                 type_: "framerate".to_owned(),
-                from: framerate_actor.name(),
+                from: framerate_actor.name().into(),
                 delta: HighResolutionStamp::new(self.start_stamp, end_time),
                 timestamps: framerate_actor.take_pending_ticks(),
             };
-            self.stream.write_json_packet(&framerateReply)?;
+            self.stream.write_json_packet(&framerate_reply)?;
         }
 
         if let Some(ref actor_name) = self.memory_actor {
             let registry = self.registry.lock().unwrap();
             let memory_actor = registry.find::<MemoryActor>(actor_name);
-            let memoryReply = MemoryEmitterReply {
+            let memory_reply = MemoryEmitterReply {
                 type_: "memory".to_owned(),
-                from: memory_actor.name(),
+                from: memory_actor.name().into(),
                 delta: HighResolutionStamp::new(self.start_stamp, end_time),
                 measurement: memory_actor.measure(),
             };
-            self.stream.write_json_packet(&memoryReply)?;
+            self.stream.write_json_packet(&memory_reply)?;
         }
 
         Ok(())

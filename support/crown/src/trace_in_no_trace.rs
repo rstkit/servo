@@ -2,18 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use rustc_ast::ast::{AttrKind, Attribute};
 use rustc_ast::token::TokenKind;
 use rustc_ast::tokenstream::TokenTree;
-use rustc_ast::AttrArgs;
 use rustc_error_messages::MultiSpan;
+use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{self as hir};
-use rustc_lint::{LateContext, LateLintPass, LintContext, LintPass, LintStore};
+use rustc_lint::{LateContext, LateLintPass, Lint, LintContext, LintPass, LintStore};
+use rustc_macros::Diagnostic;
 use rustc_middle::ty;
 use rustc_session::declare_tool_lint;
 use rustc_span::symbol::Symbol;
 
-use crate::common::{get_local_trait_def_id, get_trait_def_id, implements_trait};
+use crate::common::{find_first_crate, implements_trait, trait_in_crate};
 use crate::symbols;
 
 declare_tool_lint! {
@@ -28,13 +28,25 @@ declare_tool_lint! {
     "Warn about usage of empty Traceable objects in must_not_have_traceable marked wrappers"
 }
 
-const EMPTY_TRACE_IN_NO_TRACE_MSG: &str =
+#[derive(Diagnostic)]
+#[diag(
     "must_not_have_traceable marked wrapper is not needed for types that implements \
-empty Traceable (like primitive types). Consider removing the wrapper.";
+empty Traceable (like primitive types). Consider removing the wrapper"
+)]
+struct EmptyTraceInNoTraceDiagnostic;
+
+#[derive(Diagnostic)]
+#[diag(
+    "must_not_have_traceable marked wrapper must not have jsmanaged inside \
+on {$pos}-th position. Consider removing the wrapper"
+)]
+struct TraceInNoTraceDiagnostic {
+    pos: usize,
+}
 
 pub fn register(lint_store: &mut LintStore) {
     let symbols = Symbols::new();
-    lint_store.register_lints(&[&TRACE_IN_NO_TRACE, &EMPTY_TRACE_IN_NO_TRACE]);
+    lint_store.register_lints(&[TRACE_IN_NO_TRACE, EMPTY_TRACE_IN_NO_TRACE]);
     lint_store.register_late_pass(move |_| Box::new(NotracePass::new(symbols.clone())));
 }
 
@@ -59,26 +71,27 @@ impl LintPass for NotracePass {
     fn name(&self) -> &'static str {
         "ServoNotracePass"
     }
+
+    fn get_lints(&self) -> Vec<&'static Lint> {
+        vec![TRACE_IN_NO_TRACE, EMPTY_TRACE_IN_NO_TRACE]
+    }
 }
 
-fn get_must_not_have_traceable(sym: &Symbols, attrs: &[Attribute]) -> Option<usize> {
+fn get_must_not_have_traceable(sym: &Symbols, attrs: &[hir::Attribute]) -> Option<usize> {
     attrs
         .iter()
         .find(|attr| {
-            matches!(
-                &attr.kind,
-                AttrKind::Normal(normal)
-                if normal.item.path.segments.len() == 3 &&
-                normal.item.path.segments[0].ident.name == sym.crown &&
-                normal.item.path.segments[1].ident.name == sym.trace_in_no_trace_lint &&
-                normal.item.path.segments[2].ident.name == sym.must_not_have_traceable
-            )
+            attr.path_matches(&[
+                sym.crown,
+                sym.trace_in_no_trace_lint,
+                sym.must_not_have_traceable,
+            ])
         })
         .map(|x| match &x.get_normal_item().args {
-            AttrArgs::Empty => 0,
-            AttrArgs::Delimited(a) => match a
+            hir::AttrArgs::Empty => 0,
+            hir::AttrArgs::Delimited(a) => match a
                 .tokens
-                .trees()
+                .iter()
                 .next()
                 .expect("Arguments not found for must_not_have_traceable")
             {
@@ -96,13 +109,17 @@ fn get_must_not_have_traceable(sym: &Symbols, attrs: &[Attribute]) -> Option<usi
         })
 }
 
-fn is_jstraceable<'tcx>(cx: &LateContext<'tcx>, ty: ty::Ty<'tcx>) -> bool {
-    // TODO(sagudev): get_trait_def_id is expensive, use lazy and cache it for whole pass
-    if let Some(trait_id) = get_trait_def_id(cx, &["mozjs", "gc", "Traceable"]) {
-        return implements_trait(cx, ty, trait_id, &[]);
+fn find_jstraceable<'tcx>(cx: &LateContext<'tcx>) -> Option<DefId> {
+    // mozjs_sys::trace::Traceable
+    if let Some(mozjs) = find_first_crate(&cx.tcx, Symbol::intern("mozjs_sys")) {
+        return trait_in_crate(&cx.tcx, mozjs, Symbol::intern("Traceable"));
     }
     // when running tests
-    if let Some(trait_id) = get_local_trait_def_id(cx, "JSTraceable") {
+    trait_in_crate(&cx.tcx, LOCAL_CRATE, Symbol::intern("JSTraceable"))
+}
+
+fn is_jstraceable<'tcx>(cx: &LateContext<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    if let Some(trait_id) = find_jstraceable(cx) {
         return implements_trait(cx, ty, trait_id, &[]);
     }
     panic!("JSTraceable not found");
@@ -117,7 +134,7 @@ fn incorrect_no_trace<'tcx, I: Into<MultiSpan> + Copy>(
 ) {
     let mut walker = ty.walk();
     while let Some(generic_arg) = walker.next() {
-        let t = match generic_arg.unpack() {
+        let t = match generic_arg.kind() {
             rustc_middle::ty::GenericArgKind::Type(t) => t,
             _ => {
                 walker.skip_current_subtree();
@@ -126,29 +143,24 @@ fn incorrect_no_trace<'tcx, I: Into<MultiSpan> + Copy>(
         };
         let recur_into_subtree = match t.kind() {
             ty::Adt(did, substs) => {
-                if let Some(pos) =
-                    get_must_not_have_traceable(sym, cx.tcx.get_attrs_unchecked(did.did()))
+                // get_all_attrs is deprecated, but the suggested alternative (rustc_hir::find_attr!) doesn't work for us,
+                // because crown annotations are unparsed attributes. The deprecation warning admits that's a valid use case.
+                #[expect(deprecated)]
+                if let Some(pos) = get_must_not_have_traceable(sym, cx.tcx.get_all_attrs(did.did()))
                 {
                     let inner = substs.type_at(pos);
                     if inner.is_primitive_ty() {
-                        cx.lint(
+                        cx.emit_span_lint(
                             EMPTY_TRACE_IN_NO_TRACE,
-                            EMPTY_TRACE_IN_NO_TRACE_MSG,
-                            |lint| {
-                                lint.span(span);
-                            },
+                            span,
+                            EmptyTraceInNoTraceDiagnostic,
                         )
                     } else if is_jstraceable(cx, inner) {
-                        cx.lint(
+                        cx.emit_span_lint(
                             TRACE_IN_NO_TRACE,
-                            format!(
-                                "must_not_have_traceable marked wrapper must not have \
-jsmanaged inside on {pos}-th position. Consider removing the wrapper."
-                            ),
-                            |lint| {
-                                lint.span(span);
-                            },
-                        )
+                            span,
+                            TraceInNoTraceDiagnostic { pos },
+                        );
                     }
                     false
                 } else {
@@ -172,8 +184,8 @@ impl<'tcx> LateLintPass<'tcx> for NotracePass {
         if has_lint_attr(&self.symbols, &attrs, self.symbols.must_root) {
             return;
         }*/
-        if let hir::ItemKind::Struct(def, ..) = &item.kind {
-            for field in def.fields() {
+        if let hir::ItemKind::Struct(_, _, variant_data) = &item.kind {
+            for field in variant_data.fields() {
                 let field_type = cx.tcx.type_of(field.def_id);
                 incorrect_no_trace(&self.symbols, cx, field_type.skip_binder(), field.span);
             }
@@ -181,6 +193,7 @@ impl<'tcx> LateLintPass<'tcx> for NotracePass {
     }
 
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
+        #[expect(clippy::single_match)]
         match var.data {
             hir::VariantData::Tuple(fields, ..) => {
                 for field in fields {

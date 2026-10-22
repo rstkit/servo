@@ -53,7 +53,10 @@ test(() => {
   assert_true(bytesEqual(actual.challenge, expected.challenge));
   assertJsonEquals(actual.pubKeyCredParams, expected.pubKeyCredParams, "pk");
   assert_equals(actual.attestation, expected.attestation);
-  assertJsonEquals(actual.hints, expected.hints);
+  if (actual.hasOwnProperty('hints')) {
+    // Not all implementations support hints yet.
+    assertJsonEquals(actual.hints, expected.hints);
+  }
 }, "parseCreationOptionsFromJSON()");
 
 test(() => {
@@ -109,11 +112,6 @@ test(() => {
         write: test_b64,
       },
       credBlob: test_b64,
-      supplementalPubKeys: {
-        scopes: ["spk scope"],
-        attestation: "directest",
-        attestationFormats: ["asn2"],
-      },
       prf: {
         eval: {
           first: test_b64,
@@ -157,11 +155,6 @@ test(() => {
         write: test_bytes,
       },
       credBlob: test_bytes,
-      supplementalPubKeys: {
-        scopes: ["spk scope"],
-        attestation: "directest",
-        attestationFormats: ["asn2"],
-      },
       prf: {
         eval: {
           first: test_bytes,
@@ -174,25 +167,108 @@ test(() => {
           },
         },
       },
-      // The spec defaults the following fields:
-      attestation: "none",
-      hints: [],
     },
   };
 
-  assert_equals(actual.extensions.appidExclude, expected.extensions.appidExclude);
-  assert_equals(actual.extensions.hmacCreateSecret, expected.extensions.hmacCreateSecret);
-  assert_equals(actual.extensions.credentialProtectionPolicy, expected.extensions.credentialProtectionPolicy);
-  assert_equals(actual.extensions.enforceCredentialProtectionPolicy, expected.extensions.enforceCredentialProtectionPolicy);
-  assert_equals(actual.extensions.minPinLength, expected.extensions.minPinLength);
-  assert_equals(actual.extensions.credProps, expected.extensions.credProps);
-  assert_equals(actual.extensions.largeBlob.support, expected.extensions.largeBlob.support);
-  assert_true(bytesEqual(actual.extensions.largeBlob.write, expected.extensions.largeBlob.write));
-  assert_true(bytesEqual(actual.extensions.credBlob, expected.extensions.credBlob));
-  assertJsonEquals(actual.extensions.supplementalPubKeys, expected.extensions.supplementalPubKeys);
-  let prfValuesEquals = (a, b) => {
-    return bytesEqual(a.first, b.first) && bytesEqual(a.second, b.second);
-  };
-  assert_true(prfValuesEquals(actual.extensions.prf.eval, expected.extensions.prf.eval), "prf eval");
-  assert_true(prfValuesEquals(actual.extensions.prf.evalByCredential["test cred"], expected.extensions.prf.evalByCredential["test cred"]), "prf ebc");
+  // Some implementations do not support all of these extensions.
+  if (actual.extensions.hasOwnProperty('appidExclude')) {
+    assert_equals(
+        actual.extensions.appidExclude, expected.extensions.appidExclude);
+  }
+  if (actual.extensions.hasOwnProperty('hmacCreateSecret')) {
+    assert_equals(
+        actual.extensions.hmacCreateSecret,
+        expected.extensions.hmacCreateSecret);
+  }
+  if (actual.extensions.hasOwnProperty('credentialProtectionPolicy')) {
+    assert_equals(
+        actual.extensions.credentialProtectionPolicy,
+        expected.extensions.credentialProtectionPolicy);
+  }
+  if (actual.extensions.hasOwnProperty('enforceCredentialProtectionPolicy')) {
+    assert_equals(
+        actual.extensions.enforceCredentialProtectionPolicy,
+        expected.extensions.enforceCredentialProtectionPolicy);
+  }
+  if (actual.extensions.hasOwnProperty('minPinLength')) {
+    assert_equals(
+        actual.extensions.minPinLength, expected.extensions.minPinLength);
+  }
+  if (actual.extensions.hasOwnProperty('credProps')) {
+    assert_equals(actual.extensions.credProps, expected.extensions.credProps);
+  }
+  if (actual.extensions.hasOwnProperty('largeBlob')) {
+    assert_equals(
+        actual.extensions.largeBlob.support,
+        expected.extensions.largeBlob.support);
+    assert_true(bytesEqual(
+        actual.extensions.largeBlob.write,
+        expected.extensions.largeBlob.write));
+  }
+  if (actual.extensions.hasOwnProperty('credBlob')) {
+    assert_true(
+        bytesEqual(actual.extensions.credBlob, expected.extensions.credBlob));
+  }
+  if (actual.extensions.hasOwnProperty('prf')) {
+    let prfValuesEquals = (a, b) => {
+      return bytesEqual(a.first, b.first) && bytesEqual(a.second, b.second);
+    };
+    assert_true(
+        prfValuesEquals(
+            actual.extensions.prf.eval, expected.extensions.prf.eval),
+        'prf eval');
+    assert_true(
+        prfValuesEquals(
+            actual.extensions.prf.evalByCredential['test cred'],
+            expected.extensions.prf.evalByCredential['test cred']),
+        'prf ebc');
+  }
 }, "parseCreationOptionsFromJSON() with extensions");
+
+test(() => {
+  let actual = PublicKeyCredential.parseCreationOptionsFromJSON({
+    rp: {
+      id: "example.com",
+      name: "Example Inc",
+    },
+    user: {
+      id: test_b64,
+      name: "test@example.com",
+      displayName: "test user"
+    },
+    challenge: test_b64,
+    pubKeyCredParams: [
+      {
+        type: "public-key",
+        alg: -7,
+      },
+    ],
+    hints: ["duplicated-value", "duplicated-value", "hybrid", "hybrid"]
+  });
+  let expected = {
+    rp: {
+      id: "example.com",
+      name: "Example Inc",
+    },
+    user: {
+      id: test_bytes,
+      name: "test@example.com",
+      displayName: "test user"
+    },
+    challenge: test_bytes,
+    pubKeyCredParams: [
+      {
+        type: "public-key",
+        alg: -7,
+      },
+    ],
+    attestation: "none",
+    hints: ["duplicated-value", "duplicated-value", "hybrid", "hybrid"]
+  };
+
+  assert_equals(actual.attestation, expected.attestation);
+  if (actual.hasOwnProperty('hints')) {
+    // Not all implementations support hints yet.
+    assertJsonEquals(actual.hints, expected.hints);
+  }
+}, "parseCreationOptionsFromJSON() with duplicated hints");

@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::slice::Iter;
 
 use serde::{Deserialize, Serialize};
+use servo_base::id::WebViewId;
 
 // A device name can never be longer than 29 bytes. An adv packet is at most
 // 31 bytes long. The length and identifier of the length field take 2 bytes.
@@ -97,7 +98,7 @@ impl BluetoothScanfilterSequence {
         self.0.iter().any(BluetoothScanfilter::is_empty_or_invalid)
     }
 
-    pub fn iter(&self) -> Iter<BluetoothScanfilter> {
+    pub fn iter(&self) -> Iter<'_, BluetoothScanfilter> {
         self.0.iter()
     }
 
@@ -114,19 +115,26 @@ impl BluetoothScanfilterSequence {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RequestDeviceoptions {
+    webview_id: WebViewId,
     filters: BluetoothScanfilterSequence,
     optional_services: ServiceUUIDSequence,
 }
 
 impl RequestDeviceoptions {
     pub fn new(
+        webview_id: WebViewId,
         filters: BluetoothScanfilterSequence,
         services: ServiceUUIDSequence,
     ) -> RequestDeviceoptions {
         RequestDeviceoptions {
+            webview_id,
             filters,
             optional_services: services,
         }
+    }
+
+    pub fn webview_id(&self) -> WebViewId {
+        self.webview_id
     }
 
     pub fn get_filters(&self) -> &BluetoothScanfilterSequence {

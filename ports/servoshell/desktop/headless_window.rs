@@ -4,118 +4,134 @@
 
 //! A headless window implementation.
 
+#![deny(clippy::panic)]
+#![deny(clippy::unwrap_used)]
+
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
 
-use euclid::num::Zero;
-use euclid::{Length, Point2D, Rotation3D, Scale, Size2D, UnknownUnit, Vector3D};
-use log::warn;
-use servo::compositing::windowing::{
-    AnimationState, EmbedderCoordinates, EmbedderEvent, WindowMethods,
+use euclid::{Point2D, Scale, Size2D};
+use log::error;
+use servo::{
+    DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntRect, DeviceIntSize,
+    DevicePixel, RenderingContext, ScreenGeometry, SoftwareRenderingContext, WebView,
+    convert_rect_to_css_pixel,
 };
-use servo::servo_geometry::DeviceIndependentPixel;
-use servo::style_traits::DevicePixel;
-use servo::webrender_api::units::{DeviceIntRect, DeviceIntSize};
-use servo::webrender_traits::RenderingContext;
-use surfman::{Connection, Context, Device, SurfaceType};
+use winit::dpi::PhysicalSize;
 
-use super::events_loop::WakerEvent;
-use crate::desktop::window_trait::WindowPortsMethods;
+use crate::prefs::ServoShellPreferences;
+use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
 
-pub struct Window {
-    rendering_context: RenderingContext,
-    animation_state: Cell<AnimationState>,
+pub struct HeadlessWindow {
+    id: ServoShellWindowId,
     fullscreen: Cell<bool>,
-    device_pixel_ratio_override: Option<f32>,
-    inner_size: Cell<Size2D<i32, UnknownUnit>>,
-    event_queue: RwLock<Vec<EmbedderEvent>>,
+    device_pixel_ratio_override: Option<Scale<f32, DeviceIndependentPixel, DevicePixel>>,
+    inner_size: Cell<DeviceIntSize>,
+    screen_size: Size2D<i32, DevicePixel>,
+    // virtual top-left position of the window in device pixels.
+    window_position: Cell<Point2D<i32, DevicePixel>>,
+    rendering_context: Rc<SoftwareRenderingContext>,
 }
 
-impl Window {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
-        size: Size2D<u32, DeviceIndependentPixel>,
-        device_pixel_ratio_override: Option<f32>,
-    ) -> Rc<dyn WindowPortsMethods> {
-        // Initialize surfman
-        let connection = Connection::new().expect("Failed to create connection");
-        let adapter = connection
-            .create_software_adapter()
-            .expect("Failed to create adapter");
-        let size = size.to_untyped().to_i32();
-        let surface_type = SurfaceType::Generic { size };
-        let rendering_context = RenderingContext::create(&connection, &adapter, surface_type)
-            .expect("Failed to create WR surfman");
+impl HeadlessWindow {
+    #[servo::servo_tracing::instrument(level = "debug", name = "HeadlessWindow::new", skip_all)]
+    pub fn new(servoshell_preferences: &ServoShellPreferences) -> Rc<Self> {
+        let size = servoshell_preferences.initial_window_size;
 
-        let window = Window {
-            rendering_context,
-            animation_state: Cell::new(AnimationState::Idle),
+        let device_pixel_ratio_override = servoshell_preferences.device_pixel_ratio_override;
+        let device_pixel_ratio_override: Option<Scale<f32, DeviceIndependentPixel, DevicePixel>> =
+            device_pixel_ratio_override.map(Scale::new);
+        let hidpi_factor = device_pixel_ratio_override.unwrap_or_else(Scale::identity);
+
+        let inner_size = (size.to_f32() * hidpi_factor).to_i32();
+        let physical_size = PhysicalSize::new(inner_size.width as u32, inner_size.height as u32);
+        let rendering_context =
+            SoftwareRenderingContext::new(physical_size).expect("Failed to create WR surfman");
+
+        let screen_size = servoshell_preferences
+            .screen_size_override
+            .map_or(inner_size * 2, |screen_size_override| {
+                (screen_size_override.to_f32() * hidpi_factor).to_i32()
+            });
+
+        static CURRENT_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
+        let window = HeadlessWindow {
+            id: CURRENT_WINDOW_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .into(),
             fullscreen: Cell::new(false),
             device_pixel_ratio_override,
-            inner_size: Cell::new(size.to_i32()),
-            event_queue: RwLock::new(Vec::new()),
+            inner_size: Cell::new(inner_size),
+            screen_size,
+            window_position: Cell::new(Point2D::zero()),
+            rendering_context: Rc::new(rendering_context),
         };
 
         Rc::new(window)
     }
 }
 
-impl WindowPortsMethods for Window {
-    fn get_events(&self) -> Vec<EmbedderEvent> {
-        match self.event_queue.write() {
-            Ok(ref mut event_queue) => std::mem::take(event_queue),
-            Err(_) => vec![],
+impl Drop for HeadlessWindow {
+    fn drop(&mut self) {
+        if let Err(error) = self.rendering_context.make_current() {
+            error!("Failed to make the rendering context current: {error:?}");
+        }
+    }
+}
+
+impl PlatformWindow for HeadlessWindow {
+    fn id(&self) -> ServoShellWindowId {
+        self.id
+    }
+
+    fn screen_geometry(&self) -> servo::ScreenGeometry {
+        ScreenGeometry {
+            size: self.screen_size,
+            available_size: self.screen_size,
+            window_rect: DeviceIntRect::from_origin_and_size(
+                self.window_position.get(),
+                self.inner_size.get(),
+            ),
         }
     }
 
-    fn id(&self) -> winit::window::WindowId {
-        unsafe { winit::window::WindowId::dummy() }
+    fn set_position(&self, point: DeviceIntPoint) {
+        self.window_position.set(point);
     }
 
-    fn request_inner_size(&self, size: DeviceIntSize) -> Option<DeviceIntSize> {
-        let (width, height) = size.into();
+    fn request_repaint(&self, window: &ServoShellWindow) {
+        window.repaint_webviews();
+    }
 
-        // Surfman doesn't support zero-sized surfaces.
-        let new_size = DeviceIntSize::new(width.max(1), height.max(1));
-        if self.inner_size.get() == new_size.to_untyped() {
+    fn request_resize(&self, webview: &WebView, new_size: DeviceIntSize) -> Option<DeviceIntSize> {
+        // Do not let the window size get smaller than `MIN_WINDOW_INNER_SIZE` or larger
+        // than twice the screen size.
+        let new_size = new_size.clamp(MIN_WINDOW_INNER_SIZE, self.screen_size * 2);
+        if self.inner_size.get() == new_size {
             return Some(new_size);
         }
 
-        match self.rendering_context.resize(new_size.to_untyped()) {
-            Ok(()) => {
-                self.inner_size.set(new_size.to_untyped());
-                if let Ok(ref mut queue) = self.event_queue.write() {
-                    queue.push(EmbedderEvent::WindowResize);
-                }
-                Some(new_size)
-            },
-            Err(error) => {
-                warn!("Could not resize window: {error:?}");
-                None
-            },
-        }
+        self.inner_size.set(new_size);
+
+        // Because we are managing the rendering surface ourselves, there will be no other
+        // notification (such as from the display manager) that it has changed size, so we
+        // must notify `Paint` here.
+        webview.resize(PhysicalSize::new(
+            new_size.width as u32,
+            new_size.height as u32,
+        ));
+
+        Some(new_size)
     }
 
-    fn device_hidpi_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
+    fn device_hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
         Scale::new(1.0)
     }
 
-    fn device_pixel_ratio_override(
-        &self,
-    ) -> Option<Scale<f32, DeviceIndependentPixel, DevicePixel>> {
-        self.device_pixel_ratio_override.map(Scale::new)
-    }
-
-    fn page_height(&self) -> f32 {
-        let height = self
-            .rendering_context
-            .context_surface_info()
-            .unwrap_or(None)
-            .map(|info| info.size.height)
-            .unwrap_or(0);
-        let dpr = self.hidpi_factor();
-        height as f32 * dpr.get()
+    fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
+        self.device_pixel_ratio_override
+            .unwrap_or_else(|| self.device_hidpi_scale_factor())
     }
 
     fn set_fullscreen(&self, state: bool) {
@@ -126,77 +142,39 @@ impl WindowPortsMethods for Window {
         self.fullscreen.get()
     }
 
-    fn is_animating(&self) -> bool {
-        self.animation_state.get() == AnimationState::Animating
-    }
-
-    fn queue_embedder_events_for_winit_event(&self, _event: winit::event::WindowEvent) {
-        // Not expecting any winit events.
-    }
-
+    #[cfg(feature = "webxr")]
     fn new_glwindow(
         &self,
-        _events_loop: &winit::event_loop::EventLoopWindowTarget<WakerEvent>,
-    ) -> Box<dyn webxr::glwindow::GlWindow> {
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> Rc<dyn servo::webxr::GlWindow> {
         unimplemented!()
     }
 
-    fn winit_window(&self) -> Option<&winit::window::Window> {
-        None
+    fn window_rect(&self) -> DeviceIndependentIntRect {
+        convert_rect_to_css_pixel(
+            DeviceIntRect::from_origin_and_size(self.window_position.get(), self.inner_size.get()),
+            self.hidpi_scale_factor(),
+        )
     }
 
-    fn toolbar_height(&self) -> Length<f32, DeviceIndependentPixel> {
-        Length::zero()
-    }
-
-    fn set_toolbar_height(&self, _height: Length<f32, DeviceIndependentPixel>) {
-        unimplemented!("headless Window only")
-    }
-}
-
-impl WindowMethods for Window {
-    fn get_coordinates(&self) -> EmbedderCoordinates {
-        let dpr = self.hidpi_factor();
-        let size = self
-            .rendering_context
-            .context_surface_info()
-            .unwrap_or(None)
-            .map(|info| Size2D::from_untyped(info.size))
-            .unwrap_or(Size2D::new(0, 0));
-        let viewport = DeviceIntRect::from_origin_and_size(Point2D::zero(), size);
-        EmbedderCoordinates {
-            viewport,
-            framebuffer: size,
-            window: (size, Point2D::zero()),
-            screen: size,
-            screen_avail: size,
-            hidpi_factor: dpr,
-        }
-    }
-
-    fn set_animation_state(&self, state: AnimationState) {
-        self.animation_state.set(state);
-    }
-
-    fn rendering_context(&self) -> RenderingContext {
+    fn rendering_context(&self) -> Rc<dyn RenderingContext> {
         self.rendering_context.clone()
     }
-}
 
-impl webxr::glwindow::GlWindow for Window {
-    fn get_render_target(
-        &self,
-        _device: &mut Device,
-        _context: &mut Context,
-    ) -> webxr::glwindow::GlWindowRenderTarget {
-        unimplemented!()
+    fn maximize(&self, webview: &WebView) {
+        self.window_position.set(Point2D::zero());
+        self.inner_size.set(self.screen_size);
+        // Because we are managing the rendering surface ourselves, there will be no other
+        // notification (such as from the display manager) that it has changed size, so we
+        // must notify the `Paint` here.
+        webview.resize(PhysicalSize::new(
+            self.screen_size.width as u32,
+            self.screen_size.height as u32,
+        ));
     }
 
-    fn get_rotation(&self) -> Rotation3D<f32, UnknownUnit, UnknownUnit> {
-        Rotation3D::identity()
-    }
-
-    fn get_translation(&self) -> Vector3D<f32, UnknownUnit> {
-        Vector3D::zero()
+    fn show_console_message(&self, level: servo::ConsoleLogLevel, message: &str) {
+        println!("{message}");
+        log::log!(level.into(), "{message}");
     }
 }

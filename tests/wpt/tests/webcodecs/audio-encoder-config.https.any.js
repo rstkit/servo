@@ -57,6 +57,15 @@ const invalidConfigs = [
     },
   },
   {
+    comment: 'Bit rate present but equal to zero',
+    config: {
+      codec: 'opus',
+      sampleRate: 8000,
+      numberOfChannels: 2,
+      bitrate: 0,
+    },
+  },
+  {
     comment: 'Opus complexity too big',
     config: {
       codec: 'opus',
@@ -195,6 +204,14 @@ const validButUnsupportedConfigs = [
       numberOfChannels: 2,
     }
   },
+  {
+    comment: 'codec with spaces',
+    config: {
+      codec: '  opus  ',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+    }
+  },
 ];
 
 validButUnsupportedConfigs.forEach(entry => {
@@ -299,6 +316,22 @@ const validConfigs = [
     sampleRate: 48000,
     numberOfChannels: 2,
     opus: {},  // Use default values.
+  },
+  {
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    opus: {
+      frameDuration: 7500, // Test multiples of valid Opus frame durations.
+    }
+  },
+  {
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    opus: {
+      frameDuration: 120000,
+    }
   },
 ];
 

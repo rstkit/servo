@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 from .. import (
@@ -25,12 +26,12 @@ async def test_beforeunload(
 
     await setup_beforeunload_page(new_tab)
 
-    await bidi_session.send_command(
-        "browsingContext.navigate",
-        {
-            "context": new_tab["context"],
-            "url": url("/webdriver/tests/support/html/default.html"),
-        },
+    navigation_future = asyncio.create_task(
+        bidi_session.browsing_context.navigate(
+            context=new_tab["context"],
+            url=url("/webdriver/tests/support/html/default.html"),
+            wait="none"
+        )
     )
 
     event = await wait_for_future_safe(on_entry)
@@ -40,6 +41,12 @@ async def test_beforeunload(
             "context": new_tab["context"],
             "type": "beforeunload",
             "message": any_string,
+            **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
         },
         event,
     )
+
+    # The beforeunload prompt is accepted by default, so the navigation is
+    # expected to proceed. Wait for the navigation command to settle so that
+    # no command is still pending when the tab gets closed during teardown.
+    await wait_for_future_safe(navigation_future)

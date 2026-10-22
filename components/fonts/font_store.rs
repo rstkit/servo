@@ -2,179 +2,49 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use app_units::Au;
-use atomic_refcell::AtomicRefCell;
+use fonts_traits::{
+    FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate, FontTemplateRef,
+    FontTemplateRefMethods, IsOblique, LowercaseFontFamilyName,
+};
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
-use style::stylesheets::DocumentStyleSheet;
+use servo_arc::Arc as ServoArc;
 use style::values::computed::{FontStyle, FontWeight};
-use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey};
 
-use crate::font::FontDescriptor;
-use crate::font_cache_thread::{FontIdentifier, FontSource, LowercaseString};
-use crate::font_context::WebFontDownloadState;
-use crate::font_template::{FontTemplate, FontTemplateRef, FontTemplateRefMethods, IsOblique};
-
-#[derive(Default)]
-pub struct FontStore {
-    pub(crate) families: HashMap<LowercaseString, FontTemplates>,
-    web_fonts_loading: Vec<(DocumentStyleSheet, usize)>,
+#[derive(Default, MallocSizeOf)]
+pub(crate) struct FontStore {
+    pub(crate) families: HashMap<LowercaseFontFamilyName, FontTemplates>,
 }
-pub(crate) type CrossThreadFontStore = Arc<RwLock<FontStore>>;
+
+#[derive(Default, MallocSizeOf)]
+pub(crate) struct CrossThreadFontStore(#[conditional_malloc_size_of] Arc<RwLock<FontStore>>);
+
+impl Deref for CrossThreadFontStore {
+    type Target = Arc<RwLock<FontStore>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl FontStore {
     pub(crate) fn clear(&mut self) {
         self.families.clear();
     }
 
-    pub(crate) fn font_load_cancelled_for_stylesheet(
-        &self,
-        stylesheet: &DocumentStyleSheet,
-    ) -> bool {
-        !self
-            .web_fonts_loading
-            .iter()
-            .any(|(loading_stylesheet, _)| loading_stylesheet == stylesheet)
-    }
-
-    pub(crate) fn handle_stylesheet_removed(&mut self, stylesheet: &DocumentStyleSheet) {
-        self.web_fonts_loading
-            .retain(|(loading_stylesheet, _)| loading_stylesheet != stylesheet);
-    }
-
-    pub(crate) fn handle_web_font_load_started_for_stylesheet(
+    pub(crate) fn add_new_template(
         &mut self,
-        stylesheet: &DocumentStyleSheet,
-    ) {
-        if let Some((_, count)) = self
-            .web_fonts_loading
-            .iter_mut()
-            .find(|(loading_stylesheet, _)| loading_stylesheet == stylesheet)
-        {
-            *count += 1;
-        } else {
-            self.web_fonts_loading.push((stylesheet.clone(), 1))
-        }
-    }
-
-    fn remove_one_web_font_loading_for_stylesheet(&mut self, stylesheet: &DocumentStyleSheet) {
-        if let Some((_, count)) = self
-            .web_fonts_loading
-            .iter_mut()
-            .find(|(loading_stylesheet, _)| loading_stylesheet == stylesheet)
-        {
-            *count -= 1;
-        }
-        self.web_fonts_loading.retain(|(_, count)| *count != 0);
-    }
-
-    pub(crate) fn handle_web_font_failed_to_load(&mut self, state: &WebFontDownloadState) {
-        self.remove_one_web_font_loading_for_stylesheet(&state.stylesheet);
-    }
-
-    /// Handle a web font load finishing, adding the new font to the [`FontStore`]. If the web font
-    /// load was canceled (for instance, if the stylesheet was removed), then do nothing and return
-    /// false.
-    pub(crate) fn handle_web_font_loaded(
-        &mut self,
-        state: &WebFontDownloadState,
+        family_name: LowercaseFontFamilyName,
         new_template: FontTemplate,
-    ) -> bool {
-        // Abort processing this web font if the originating stylesheet was removed.
-        if self.font_load_cancelled_for_stylesheet(&state.stylesheet) {
-            return false;
-        }
-
-        let family_name = state.css_font_face_descriptors.family_name.clone();
+    ) {
         self.families
             .entry(family_name)
             .or_default()
             .add_template(new_template);
-        self.remove_one_web_font_loading_for_stylesheet(&state.stylesheet);
-        true
-    }
-
-    pub(crate) fn number_of_fonts_still_loading(&self) -> usize {
-        self.web_fonts_loading.iter().map(|(_, count)| count).sum()
-    }
-}
-
-#[derive(Default)]
-pub struct WebRenderFontStore {
-    pub(crate) webrender_font_key_map: HashMap<FontIdentifier, FontKey>,
-    pub(crate) webrender_font_instance_map: HashMap<(FontKey, Au), FontInstanceKey>,
-}
-pub(crate) type CrossThreadWebRenderFontStore = Arc<RwLock<WebRenderFontStore>>;
-
-impl WebRenderFontStore {
-    pub(crate) fn get_font_instance<FCT: FontSource>(
-        &mut self,
-        font_cache_thread: &FCT,
-        font_template: FontTemplateRef,
-        pt_size: Au,
-        flags: FontInstanceFlags,
-    ) -> FontInstanceKey {
-        let webrender_font_key_map = &mut self.webrender_font_key_map;
-        let identifier = font_template.identifier().clone();
-        let font_key = *webrender_font_key_map
-            .entry(identifier.clone())
-            .or_insert_with(|| {
-                font_cache_thread.get_web_font(font_template.data(), identifier.index())
-            });
-
-        *self
-            .webrender_font_instance_map
-            .entry((font_key, pt_size))
-            .or_insert_with(|| {
-                font_cache_thread.get_web_font_instance(font_key, pt_size.to_f32_px(), flags)
-            })
-    }
-
-    pub(crate) fn remove_all_fonts(&mut self) -> (Vec<FontKey>, Vec<FontInstanceKey>) {
-        (
-            self.webrender_font_key_map
-                .drain()
-                .map(|(_, key)| key)
-                .collect(),
-            self.webrender_font_instance_map
-                .drain()
-                .map(|(_, key)| key)
-                .collect(),
-        )
-    }
-
-    pub(crate) fn remove_all_fonts_for_identifiers(
-        &mut self,
-        identifiers: HashSet<FontIdentifier>,
-    ) -> (Vec<FontKey>, Vec<FontInstanceKey>) {
-        let mut removed_keys: HashSet<FontKey> = HashSet::new();
-        self.webrender_font_key_map.retain(|identifier, font_key| {
-            if identifiers.contains(identifier) {
-                removed_keys.insert(*font_key);
-                false
-            } else {
-                true
-            }
-        });
-
-        let mut removed_instance_keys: HashSet<FontInstanceKey> = HashSet::new();
-        self.webrender_font_instance_map
-            .retain(|(font_key, _), instance_key| {
-                if removed_keys.contains(font_key) {
-                    removed_instance_keys.insert(*instance_key);
-                    false
-                } else {
-                    true
-                }
-            });
-
-        (
-            removed_keys.into_iter().collect(),
-            removed_instance_keys.into_iter().collect(),
-        )
     }
 }
 
@@ -184,8 +54,8 @@ impl WebRenderFontStore {
 /// have a complex set of fonts.
 ///
 /// This optimization is taken from:
-/// https://searchfox.org/mozilla-central/source/gfx/thebes/gfxFontEntry.cpp.
-#[derive(Clone, Debug, Default)]
+/// <https://searchfox.org/mozilla-central/source/gfx/thebes/gfxFontEntry.cpp>.
+#[derive(Clone, Debug, Default, MallocSizeOf)]
 struct SimpleFamily {
     regular: Option<FontTemplateRef>,
     bold: Option<FontTemplateRef>,
@@ -196,7 +66,7 @@ struct SimpleFamily {
 impl SimpleFamily {
     /// Find a font in this family that matches a given descriptor.
     fn find_for_descriptor(&self, descriptor_to_match: &FontDescriptor) -> Option<FontTemplateRef> {
-        let want_bold = descriptor_to_match.weight >= FontWeight::BOLD_THRESHOLD;
+        let want_bold = descriptor_to_match.weight > FontWeight::PREFER_BOLD_THRESHOLD;
         let want_italic = descriptor_to_match.style != FontStyle::NORMAL;
 
         // This represents the preference of which font to return from the [`SimpleFamily`],
@@ -207,16 +77,15 @@ impl SimpleFamily {
             (false, true) => [&self.italic, &self.bold_italic, &self.regular, &self.bold],
             (false, false) => [&self.regular, &self.bold, &self.italic, &self.bold_italic],
         };
-        preference
-            .iter()
-            .filter_map(|template| (*template).clone())
-            .next()
+        preference.iter().find_map(|template| (*template).clone())
     }
 
-    fn remove_templates_for_stylesheet(&mut self, stylesheet: &DocumentStyleSheet) {
+    fn remove_templates_for_font_face_rule(&mut self, font_face_rule: &ServoArc<FontFaceRuleInfo>) {
         let remove_if_template_matches = |template: &mut Option<FontTemplateRef>| {
-            if template.as_ref().map_or(false, |template| {
-                template.borrow().stylesheet.as_ref() == Some(stylesheet)
+            if template.as_ref().is_some_and(|template| {
+                template
+                    .borrow()
+                    .is_defined_by_font_face_rule(font_face_rule)
             }) {
                 *template = None;
             }
@@ -240,7 +109,7 @@ impl SimpleFamily {
     }
 }
 /// A list of font templates that make up a given font family.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub struct FontTemplates {
     pub(crate) templates: Vec<FontTemplateRef>,
     simple_family: Option<SimpleFamily>,
@@ -313,7 +182,7 @@ impl FontTemplates {
             }
         }
 
-        let new_template = Arc::new(AtomicRefCell::new(new_template));
+        let new_template = FontTemplateRef::new(new_template);
         self.templates.push(new_template.clone());
         self.update_simple_family(new_template);
     }
@@ -341,11 +210,11 @@ impl FontTemplates {
             return;
         };
 
-        // If the stretch between any of these fonts differ, it cannot be a simple family nor if this
+        // If the width between any of these fonts differ, it cannot be a simple family nor if this
         // font is oblique.
-        let stretch = added_template.descriptor().stretch.0;
+        let width = added_template.descriptor().width.0;
         let style = added_template.descriptor().style.0;
-        if first.descriptor().stretch.0 != stretch || style.is_oblique() {
+        if first.descriptor().width.0 != width || style.is_oblique() {
             self.simple_family = None;
             return;
         }
@@ -370,19 +239,20 @@ impl FontTemplates {
         slot.replace(added_template);
     }
 
-    pub(crate) fn remove_templates_for_stylesheet(
+    /// Returns true if any templates were removed.
+    pub(crate) fn remove_template_for_font_face_rule(
         &mut self,
-        stylesheet: &DocumentStyleSheet,
+        removed_rule: &ServoArc<FontFaceRuleInfo>,
     ) -> bool {
-        let length_before = self.templates.len();
+        let old_length = self.templates.len();
         self.templates
-            .retain(|template| template.borrow().stylesheet.as_ref() != Some(stylesheet));
+            .retain(|template| !template.borrow().is_defined_by_font_face_rule(removed_rule));
 
         if let Some(simple_family) = self.simple_family.as_mut() {
-            simple_family.remove_templates_for_stylesheet(stylesheet);
+            simple_family.remove_templates_for_font_face_rule(removed_rule);
         }
 
-        length_before != self.templates.len()
+        self.templates.len() != old_length
     }
 
     pub(crate) fn for_all_identifiers(&self, mut callback: impl FnMut(&FontIdentifier)) {

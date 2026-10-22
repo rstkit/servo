@@ -5,15 +5,11 @@
 # Tool options
 [tools]
 
-# If uncommented, this command is used instead of the platform’s default
-# to notify at the end of a compilation that took a long time.
-# This is the name or path of an executable called with two arguments:
-# the summary and content of the notification.
-#notify-command = "notify-send"
-
 [build]
 # Set "mode = dev" or use `mach build --dev` to build the project with warning.
 # or Set "mode = release" or use `mach build --release` for optimized build.
+# Use `mode = <profile>` or `mach build --profile=<profile>` to build the given
+# profile. Check the `Cargo.toml` manifest for a complete list of custom profiles.
 # Defaults to prompting before building
 #mode = "dev"
 
@@ -34,10 +30,8 @@ webgl-backtrace = false
 # that triggered it.
 dom-backtrace = false
 
-# Default to the “2020” implementation of CSS layout instead of the “2013” one.
-layout-2020 = true
-
 # Pick a media stack based on the target. Other values are "gstreamer" and "dummy"
+# Note that the "gstreamer" setting is currently ignored on Android and OHOS.
 media-stack = "auto"
 
 # Set to the path to your ccache binary to enable caching of compiler outputs

@@ -1,33 +1,38 @@
 [package]
-name = "canvas_traits"
+name = "servo-canvas-traits"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [lib]
-name = "canvas_traits"
+name = "servo_canvas_traits"
 path = "lib.rs"
 
 [features]
 webgl_backtrace = []
-xr-profile = ["webxr-api/profile", "time"]
 
 [dependencies]
-base = { workspace = true }
 crossbeam-channel = { workspace = true }
 euclid = { workspace = true }
-ipc-channel = { workspace = true }
-lazy_static = { workspace = true }
+fonts_traits = { workspace = true }
+glow = { workspace = true }
+kurbo = { workspace = true, features = ["serde"] }
+log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
-pixels = { path = "../../pixels" }
+pixels = { workspace = true }
+profile_traits = { workspace = true }
 serde = { workspace = true }
-serde_bytes = { workspace = true }
-servo_config = { path = "../../config" }
-sparkle = { workspace = true }
-style = { workspace = true }
-time = { workspace = true, optional = true }
+servo-base = { workspace = true }
+strum = { workspace = true }
+stylo = { workspace = true }
 webrender_api = { workspace = true }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
+webxr-api = { workspace = true }
+
+[lints]
+workspace = true

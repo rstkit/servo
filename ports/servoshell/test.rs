@@ -89,15 +89,17 @@ fn test_argument_parsing_special() {
 // Helper function to test url
 fn test_url(input: &str, location: &str, cmdline_if_exists: &str, cmdline_otherwise: &str) {
     assert_eq!(
-        location_bar_input_to_url(input).unwrap().into_string(),
+        location_bar_input_to_url(input, "https://duckduckgo.com/html/?q=%s")
+            .unwrap()
+            .into_string(),
         location
     );
     assert_eq!(
-        get_default_url(Some(input), FAKE_CWD, |_| true).into_string(),
+        get_default_url(Some(input), FAKE_CWD, |_| true, &Default::default()).into_string(),
         cmdline_if_exists
     );
     assert_eq!(
-        get_default_url(Some(input), FAKE_CWD, |_| false).into_string(),
+        get_default_url(Some(input), FAKE_CWD, |_| false, &Default::default()).into_string(),
         cmdline_otherwise
     );
 }
@@ -110,6 +112,12 @@ fn test_cmdline_and_location_bar_url() {
         "data:text/html,a",
         "data:text/html,a",
         "data:text/html,a",
+    );
+    test_url(
+        "servo:config",
+        "servo:config",
+        "servo:config",
+        "servo:config",
     );
     test_url(
         "README.md",
@@ -153,6 +161,12 @@ fn test_cmdline_and_location_bar_url() {
         "file:///fake/cwd/dragonfruit",
         "https://duckduckgo.com/html/?q=dragonfruit",
     );
+    test_url(
+        "localhost:8000",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+    )
 }
 
 #[test]
@@ -163,6 +177,12 @@ fn test_cmdline_and_location_bar_url() {
         "data:text/html,a",
         "data:text/html,a",
         "data:text/html,a",
+    );
+    test_url(
+        "servo:config",
+        "servo:config",
+        "servo:config",
+        "servo:config",
     );
     test_url(
         "README.md",
@@ -206,6 +226,12 @@ fn test_cmdline_and_location_bar_url() {
         "file:///C:/fake/cwd/dragonfruit",
         "https://duckduckgo.com/html/?q=dragonfruit",
     );
+    test_url(
+        "localhost:8000",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -216,5 +242,76 @@ fn test_cmd_and_location_bar_url() {
         "file:///dev/null",
         "file:///dev/null",
         "file:///dev/null",
+    );
+}
+
+/// Like [test_url] but will produce test for Windows or non Windows using `#[cfg(target_os)]` internally.
+#[cfg(not(target_os = "windows"))]
+fn test_url_any_os(
+    input: &str,
+    location: &str,
+    if_exists: &str,
+    _if_exists_windows: &str,
+    otherwise: &str,
+) {
+    test_url(input, location, if_exists, otherwise);
+}
+
+#[cfg(target_os = "windows")]
+fn test_url_any_os(
+    input: &str,
+    location: &str,
+    _if_exists: &str,
+    if_exists_windows: &str,
+    otherwise: &str,
+) {
+    test_url(input, location, if_exists_windows, otherwise);
+}
+
+// https://github.com/servo/servo/issues/35754
+#[test]
+fn test_issue_35754() {
+    test_url_any_os(
+        "leah.chromebooks.lol",
+        "https://leah.chromebooks.lol/",
+        "file:///fake/cwd/leah.chromebooks.lol",
+        "file:///C:/fake/cwd/leah.chromebooks.lol",
+        "https://leah.chromebooks.lol/",
+    );
+
+    // ends with dot
+    test_url_any_os(
+        "leah.chromebooks.lol.",
+        "https://leah.chromebooks.lol./",
+        "file:///fake/cwd/leah.chromebooks.lol.",
+        "file:///C:/fake/cwd/leah.chromebooks.lol.",
+        "https://leah.chromebooks.lol./",
+    );
+
+    // starts with dot
+    test_url_any_os(
+        ".leah.chromebooks.lol",
+        "https://duckduckgo.com/html/?q=.leah.chromebooks.lol",
+        "file:///fake/cwd/.leah.chromebooks.lol",
+        "file:///C:/fake/cwd/.leah.chromebooks.lol",
+        "https://duckduckgo.com/html/?q=.leah.chromebooks.lol",
+    );
+
+    // contains spaces
+    test_url_any_os(
+        "3.5 kg in lb",
+        "https://duckduckgo.com/html/?q=3.5%20kg%20in%20lb",
+        "file:///fake/cwd/3.5%20kg%20in%20lb",
+        "file:///C:/fake/cwd/3.5%20kg%20in%20lb",
+        "https://duckduckgo.com/html/?q=3.5%20kg%20in%20lb",
+    );
+
+    // user-local domain
+    test_url_any_os(
+        "foo/bar",
+        "https://foo/bar",
+        "file:///fake/cwd/foo/bar",
+        "file:///C:/fake/cwd/foo/bar",
+        "https://foo/bar",
     );
 }

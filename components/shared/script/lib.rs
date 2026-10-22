@@ -9,199 +9,79 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
-mod script_msg;
-pub mod serializable;
-pub mod transferable;
-pub mod webdriver_msg;
-
-use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::cell::Cell;
 use std::fmt;
-use std::sync::Arc;
 
-use background_hang_monitor_api::BackgroundHangMonitorRegister;
-use base::id::{
-    BlobId, BrowsingContextId, HistoryStateId, MessagePortId, PipelineId, PipelineNamespaceId,
-    TopLevelBrowsingContextId,
-};
-use base::Epoch;
+use accesskit::ActionRequest;
 use bitflags::bitflags;
-use bluetooth_traits::BluetoothRequest;
-use canvas_traits::webgl::WebGLPipeline;
-use crossbeam_channel::{RecvTimeoutError, Sender};
-use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
-use embedder_traits::CompositorEventVariant;
-use euclid::default::Point2D;
-use euclid::{Length, Rect, Scale, Size2D, UnknownUnit, Vector2D};
-use http::{HeaderMap, Method};
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
-use ipc_channel::Error as IpcError;
-use keyboard_types::webdriver::Event as WebDriverInputEvent;
-use keyboard_types::{CompositionEvent, KeyboardEvent};
-use libc::c_void;
-use log::warn;
+use crossbeam_channel::RecvTimeoutError;
+#[cfg(feature = "devtools")]
+use devtools_traits::ScriptToDevtoolsControlMsg;
+use embedder_traits::user_contents::{UserContentManagerId, UserContents};
+use embedder_traits::{
+    EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber, InputEvent, InputEventAndId,
+    JavaScriptEvaluationId, MediaSessionActionType, MouseButton, PaintHitTestResult,
+    ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+};
+use euclid::{Scale, Size2D};
+use fonts_traits::{SystemFontServiceProxySender, WebFontLoadEvent};
+use keyboard_types::Modifiers;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use media::WindowGLContext;
-use net_traits::image_cache::ImageCache;
-use net_traits::request::{Referrer, RequestBody};
-use net_traits::storage_thread::StorageType;
-use net_traits::{FetchResponseMsg, ReferrerPolicy, ResourceThreads};
-use pixels::{Image, PixelFormat};
-use profile_traits::{mem, time as profile_time};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use servo_atoms::Atom;
-use servo_url::{ImmutableOrigin, ServoUrl};
-use style_traits::{CSSPixel, SpeculativePainter};
-use webgpu::WebGPUMsg;
-use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel};
-use webrender_api::{DocumentId, ExternalScrollId, ImageKey};
-use webrender_traits::{UntrustedNodeAddress as WebRenderUntrustedNodeAddress, WebRenderScriptApi};
-
-pub use crate::script_msg::{
-    DOMMessage, EventResult, HistoryEntryReplacement, IFrameSizeMsg, Job, JobError, JobResult,
-    JobResultValue, JobType, LayoutMsg, LogEntry, SWManagerMsg, SWManagerSenders, ScopeThings,
-    ScriptMsg, ServiceWorkerMsg, TraversalDirection,
+use net_traits::ResourceThreads;
+use paint_api::{CrossProcessPaintApi, PinchZoomInfos};
+use pixels::PixelFormat;
+use profile_traits::mem;
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
+use servo_base::Epoch;
+#[cfg(feature = "devtools")]
+use servo_base::generic_channel::GenericCallback;
+use servo_base::generic_channel::{GenericReceiver, GenericSender};
+use servo_base::id::{
+    BrowsingContextId, HistoryStateId, LCPCandidateID, PipelineId, PipelineNamespaceId,
+    PipelineNamespaceRequest, ScriptEventLoopId, ServiceWorkerId, WebViewId,
 };
-use crate::serializable::{BlobData, BlobImpl};
-use crate::transferable::MessagePortImpl;
-use crate::webdriver_msg::{LoadStatus, WebDriverScriptCommand};
+#[cfg(feature = "bluetooth")]
+use servo_bluetooth_traits::BluetoothRequest;
+#[cfg(feature = "webgl")]
+use servo_canvas_traits::webgl::WebGLPipeline;
+use servo_config::prefs::PrefValue;
+use servo_constellation_traits::{
+    KeyboardScroll, LoadData, NavigationHistoryBehavior, PaintMetricEvent, RemoteFocusOperation,
+    ScriptToConstellationSender, ScrollStateUpdate, ServiceWorkerState, StructuredSerializedData,
+    TargetSnapshotParams, WindowSizeType,
+};
+use servo_url::{ImmutableOrigin, OriginSnapshot, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::WebStorageType;
+use strum::IntoStaticStr;
+use style_traits::{CSSPixel, SpeculativePainter};
+use stylo_atoms::Atom;
+#[cfg(feature = "webgpu")]
+use webgpu_traits::WebGPUMsg;
+use webrender_api::ImageKey;
+use webrender_api::units::DevicePixel;
 
-/// The address of a node. Layout sends these back. They must be validated via
-/// `from_untrusted_node_address` before they can be used, because we do not trust layout.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct UntrustedNodeAddress(pub *const c_void);
-
-malloc_size_of_is_0!(UntrustedNodeAddress);
-
-#[allow(unsafe_code)]
-unsafe impl Send for UntrustedNodeAddress {}
-
-impl From<WebRenderUntrustedNodeAddress> for UntrustedNodeAddress {
-    fn from(o: WebRenderUntrustedNodeAddress) -> Self {
-        UntrustedNodeAddress(o.0 as *const c_void)
-    }
+/// A representation of the `WebView` state that is kept in each `EventLoop`
+/// and in the `Constellation`.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct WebViewState {
+    /// The [`WebViewId`] of this `WebView`.
+    pub id: WebViewId,
+    /// The platform [`Theme`] to use for this `WebView`.
+    pub theme: Cell<Theme>,
+    /// Whether or not the `WebView` has system focus. More than one `WebView` may have
+    /// system focus at one time.
+    pub has_system_focus: Cell<bool>,
 }
 
-impl From<style_traits::dom::OpaqueNode> for UntrustedNodeAddress {
-    fn from(o: style_traits::dom::OpaqueNode) -> Self {
-        UntrustedNodeAddress(o.0 as *const c_void)
-    }
-}
-
-impl Serialize for UntrustedNodeAddress {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        (self.0 as usize).serialize(s)
-    }
-}
-
-impl<'de> Deserialize<'de> for UntrustedNodeAddress {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<UntrustedNodeAddress, D::Error> {
-        let value: usize = Deserialize::deserialize(d)?;
-        Ok(UntrustedNodeAddress::from_id(value))
-    }
-}
-
-impl UntrustedNodeAddress {
-    /// Creates an `UntrustedNodeAddress` from the given pointer address value.
-    #[inline]
-    pub fn from_id(id: usize) -> UntrustedNodeAddress {
-        UntrustedNodeAddress(id as *const c_void)
-    }
-}
-
-/// The origin where a given load was initiated.
-/// Useful for origin checks, for example before evaluation a JS URL.
+/// The initial data required to create a new `Pipeline` attached to an existing `ScriptThread`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum LoadOrigin {
-    /// A load originating in the constellation.
-    Constellation,
-    /// A load originating in webdriver.
-    WebDriver,
-    /// A load originating in script.
-    Script(ImmutableOrigin),
-}
-
-/// can be passed to `LoadUrl` to load a page with GET/POST
-/// parameters or headers
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LoadData {
-    /// The origin where the load started.
-    pub load_origin: LoadOrigin,
-    /// The URL.
-    pub url: ServoUrl,
-    /// The creator pipeline id if this is an about:blank load.
-    pub creator_pipeline_id: Option<PipelineId>,
-    /// The method.
-    #[serde(
-        deserialize_with = "::hyper_serde::deserialize",
-        serialize_with = "::hyper_serde::serialize"
-    )]
-    pub method: Method,
-    /// The headers.
-    #[serde(
-        deserialize_with = "::hyper_serde::deserialize",
-        serialize_with = "::hyper_serde::serialize"
-    )]
-    pub headers: HeaderMap,
-    /// The data that will be used as the body of the request.
-    pub data: Option<RequestBody>,
-    /// The result of evaluating a javascript scheme url.
-    pub js_eval_result: Option<JsEvalResult>,
-    /// The referrer.
-    pub referrer: Referrer,
-    /// The referrer policy.
-    pub referrer_policy: Option<ReferrerPolicy>,
-
-    /// The source to use instead of a network response for a srcdoc document.
-    pub srcdoc: String,
-    /// The inherited context is Secure, None if not inherited
-    pub inherited_secure_context: Option<bool>,
-
-    /// Servo internal: if crash details are present, trigger a crash error page with these details.
-    pub crash: Option<String>,
-}
-
-/// The result of evaluating a javascript scheme url.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum JsEvalResult {
-    /// The js evaluation had a non-string result, 204 status code.
-    /// <https://html.spec.whatwg.org/multipage/#navigate> 12.11
-    NoContent,
-    /// The js evaluation had a string result.
-    Ok(Vec<u8>),
-}
-
-impl LoadData {
-    /// Create a new `LoadData` object.
-    pub fn new(
-        load_origin: LoadOrigin,
-        url: ServoUrl,
-        creator_pipeline_id: Option<PipelineId>,
-        referrer: Referrer,
-        referrer_policy: Option<ReferrerPolicy>,
-        inherited_secure_context: Option<bool>,
-    ) -> LoadData {
-        LoadData {
-            load_origin,
-            url,
-            creator_pipeline_id,
-            method: Method::GET,
-            headers: HeaderMap::new(),
-            data: None,
-            js_eval_result: None,
-            referrer,
-            referrer_policy,
-            srcdoc: "".to_string(),
-            inherited_secure_context,
-            crash: None,
-        }
-    }
-}
-
-/// The initial data required to create a new layout attached to an existing script thread.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct NewLayoutInfo {
+pub struct NewPipelineInfo {
+    /// The [`WebViewState`] of the `WebView` that this pipeline belongs to.
+    pub webview_state: WebViewState,
     /// The ID of the parent pipeline and frame type, if any.
     /// If `None`, this is a root pipeline.
     pub parent_info: Option<PipelineId>,
@@ -209,14 +89,18 @@ pub struct NewLayoutInfo {
     pub new_pipeline_id: PipelineId,
     /// Id of the browsing context associated with this pipeline.
     pub browsing_context_id: BrowsingContextId,
-    /// Id of the top-level browsing context associated with this pipeline.
-    pub top_level_browsing_context_id: TopLevelBrowsingContextId,
     /// Id of the opener, if any
     pub opener: Option<BrowsingContextId>,
     /// Network request data which will be initiated by the script thread.
     pub load_data: LoadData,
-    /// Information about the initial window size.
-    pub window_size: WindowSizeData,
+    /// Initial [`ViewportDetails`] for this layout.
+    pub viewport_details: ViewportDetails,
+    /// The ID of the `UserContentManager` associated with this new pipeline's `WebView`.
+    pub user_content_manager_id: Option<UserContentManagerId>,
+    /// A snapshot of the navigation parameters of the target of this navigation.
+    pub target_snapshot_params: TargetSnapshotParams,
+    /// Name of this iframe, if any
+    pub frame_name: Option<String>,
 }
 
 /// When a pipeline is closed, should its browsing context be discarded too?
@@ -246,12 +130,17 @@ pub enum DocumentActivity {
 }
 
 /// Type of recorded progressive web metric
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ProgressiveWebMetricType {
     /// Time to first Paint
     FirstPaint,
     /// Time to first contentful paint
     FirstContentfulPaint,
+    /// Time for the largest contentful paint
+    LargestContentfulPaint {
+        /// The identity of the element, if any.
+        id: LCPCandidateID,
+    },
     /// Time to interactive
     TimeToInteractive,
 }
@@ -265,72 +154,95 @@ pub enum UpdatePipelineIdReason {
     Traversal,
 }
 
-/// Messages sent from the constellation or layout to the script thread.
-#[derive(Deserialize, Serialize)]
-pub enum ConstellationControlMsg {
+/// Messages sent to the `ScriptThread` event loop from the `Constellation`, `Paint`, and (for
+/// now) `Layout`.
+#[derive(Deserialize, IntoStaticStr, Serialize)]
+pub enum ScriptThreadMessage {
+    /// Update the state of a service worker.
+    UpdateServiceWorkerState {
+        /// The identity of the service worker.
+        worker_id: ServiceWorkerId,
+        /// The new state of the service worker.
+        state: ServiceWorkerState,
+        /// The pipeline.
+        pipeline_id: PipelineId,
+    },
+    /// Span a new `Pipeline` in this `ScriptThread` and start fetching the contents
+    /// according to the provided `LoadData`. This will ultimately create a `Window`
+    /// and all associated data structures such as `Layout` in the `ScriptThread`.
+    SpawnPipeline(NewPipelineInfo),
     /// Takes the associated window proxy out of "delaying-load-events-mode",
     /// used if a scheduled navigated was refused by the embedder.
     /// <https://html.spec.whatwg.org/multipage/#delaying-load-events-mode>
     StopDelayingLoadEventsMode(PipelineId),
-    /// Sends the final response to script thread for fetching after all redirections
-    /// have been resolved
-    NavigationResponse(PipelineId, FetchResponseMsg),
-    /// Gives a channel and ID to a layout, as well as the ID of that layout's parent
-    AttachLayout(NewLayoutInfo),
     /// Window resized.  Sends a DOM event eventually, but first we combine events.
-    Resize(PipelineId, WindowSizeData, WindowSizeType),
+    Resize(PipelineId, ViewportDetails, WindowSizeType),
+    /// Inform the ScriptThread that some aspect of the WebViewState has changed.
+    UpdateWebViewState(WebViewState),
     /// Notifies script that window has been resized but to not take immediate action.
-    ResizeInactive(PipelineId, WindowSizeData),
+    ResizeInactive(PipelineId, ViewportDetails),
     /// Window switched from fullscreen mode.
     ExitFullScreen(PipelineId),
     /// Notifies the script that the document associated with this pipeline should 'unload'.
     UnloadDocument(PipelineId),
     /// Notifies the script that a pipeline should be closed.
-    ExitPipeline(PipelineId, DiscardBrowsingContext),
+    ExitPipeline(WebViewId, PipelineId, DiscardBrowsingContext),
     /// Notifies the script that the whole thread should be closed.
     ExitScriptThread,
     /// Sends a DOM event.
-    SendEvent(PipelineId, CompositorEvent),
-    /// Notifies script of the viewport.
-    Viewport(PipelineId, Rect<f32, UnknownUnit>),
+    SendInputEvent(WebViewId, PipelineId, ConstellationInputEvent),
+    /// Request that the given pipeline refresh the cursor by doing a hit test at the most
+    /// recently hovered cursor position and resetting the cursor. This happens after a
+    /// display list update is rendered.
+    RefreshCursor(PipelineId),
     /// Requests that the script thread immediately send the constellation the title of a pipeline.
     GetTitle(PipelineId),
+    /// Retrieve the origin of a document for a pipeline, in case a child needs to retrieve the
+    /// origin of a parent in a different script thread.
+    GetDocumentOrigin(PipelineId, GenericSender<Option<OriginSnapshot>>),
+    /// Retrieve the origin and internal ancestor origin objects list of a
+    /// `Document` for a given `PipelineId`, in case a child needs to retrieve
+    /// the origin of a parent in a different event loop.
+    GetDocumentOriginDetails(
+        PipelineId,
+        GenericSender<Option<(OriginSnapshot, Vec<ImmutableOrigin>)>>,
+    ),
     /// Notifies script thread of a change to one of its document's activity
     SetDocumentActivity(PipelineId, DocumentActivity),
     /// Set whether to use less resources by running timers at a heavily limited rate.
     SetThrottled(PipelineId, bool),
-    /// Notify the containing iframe (in PipelineId) that the nested browsing context (BrowsingContextId) is throttled.
-    SetThrottledInContainingIframe(PipelineId, BrowsingContextId, bool),
     /// Notifies script thread that a url should be loaded in this iframe.
     /// PipelineId is for the parent, BrowsingContextId is for the nested browsing context
     NavigateIframe(
         PipelineId,
         BrowsingContextId,
         LoadData,
-        HistoryEntryReplacement,
+        NavigationHistoryBehavior,
+        TargetSnapshotParams,
     ),
     /// Post a message to a given window.
     PostMessage {
         /// The target of the message.
         target: PipelineId,
-        /// The source of the message.
-        source: PipelineId,
-        /// The top level browsing context associated with the source pipeline.
-        source_browsing_context: TopLevelBrowsingContextId,
+        /// The webview associated with the source pipeline.
+        source_webview: WebViewId,
+        /// The ancestry of browsing context associated with the source,
+        /// starting with the source itself.
+        source_with_ancestry: Vec<BrowsingContextId>,
         /// The expected origin of the target.
         target_origin: Option<ImmutableOrigin>,
         /// The source origin of the message.
         /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-origin>
         source_origin: ImmutableOrigin,
         /// The data to be posted.
-        data: StructuredSerializedData,
+        data: Box<StructuredSerializedData>,
     },
     /// Updates the current pipeline ID of a given iframe.
     /// First PipelineId is for the parent, second is the new PipelineId for the frame.
     UpdatePipelineId(
         PipelineId,
         BrowsingContextId,
-        TopLevelBrowsingContextId,
+        WebViewId,
         PipelineId,
         UpdatePipelineIdReason,
     ),
@@ -338,16 +250,31 @@ pub enum ConstellationControlMsg {
     UpdateHistoryState(PipelineId, Option<HistoryStateId>, ServoUrl),
     /// Removes inaccesible history states.
     RemoveHistoryStates(PipelineId, Vec<HistoryStateId>),
-    /// Set an iframe to be focused. Used when an element in an iframe gains focus.
-    /// PipelineId is for the parent, BrowsingContextId is for the nested browsing context
-    FocusIFrame(PipelineId, BrowsingContextId),
+    /// Focus a `Document` as part of the focusing steps which focuses all parent `Document`s of a
+    /// newly focused `<iframe>`. Note that this is not used for the `Document` and `Element` that
+    /// is gaining focus as that is handled locally in the originating `ScriptThread`.
+    FocusDocumentAsPartOfFocusingSteps(PipelineId, FocusSequenceNumber, Option<BrowsingContextId>),
+    /// Unfocus a `Document` as part of the focusing steps which unfocuses all parent `Document`s of an
+    /// `<iframe>` losing focus. This does not do anything for a top-level `Document`, which can never
+    /// lose focus (apart from losing system focus, which is a separate concept).
+    UnfocusDocumentAsPartOfFocusingSteps(PipelineId, FocusSequenceNumber),
+    /// Focus a `Document` and run the focusing steps. This is used in two situations:
+    /// - When calling the DOM `focus()` API on a remote `Window` as well as from
+    ///   WebDriver. The difference between this and `FocusDocumentAsPartOfFocusingSteps` is that this
+    ///   version actually does run the focusing steps and may result in blur and focus events firing
+    ///   up the frame tree.
+    /// - When doing sequential focus navigation into and out of frames.
+    FocusDocument(PipelineId, RemoteFocusOperation),
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId, AnimationTickType),
-    /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
-    /// reflowed.
-    WebFontLoaded(PipelineId, bool /* success */),
+    TickAllAnimations(Vec<WebViewId>),
+    /// Notifies the script thread that a web font has finished loading.
+    ///
+    /// This is sent if either the web font loaded successfully, or to notify the script thread
+    /// that it should try to resolve `document.fonts.ready` because the font was the last one
+    /// loading.
+    WebFontLoadFinished(PipelineId, WebFontLoadEvent),
     /// Cause a `load` event to be dispatched at the appropriate iframe element.
     DispatchIFrameLoadEvent {
         /// The frame that has been marked as loaded.
@@ -361,68 +288,79 @@ pub enum ConstellationControlMsg {
     /// The strings are key, old value and new value.
     DispatchStorageEvent(
         PipelineId,
-        StorageType,
+        WebStorageType,
         ServoUrl,
         Option<String>,
         Option<String>,
         Option<String>,
     ),
     /// Report an error from a CSS parser for the given pipeline
+    #[cfg(feature = "devtools")]
     ReportCSSError(PipelineId, String, u32, u32, String),
     /// Reload the given page.
     Reload(PipelineId),
     /// Notifies the script thread about a new recorded paint metric.
-    PaintMetric(PipelineId, ProgressiveWebMetricType, u64),
+    PaintMetric(PipelineId, PaintMetricEvent),
     /// Notifies the media session about a user requested media session action.
     MediaSessionAction(PipelineId, MediaSessionActionType),
     /// Notifies script thread that WebGPU server has started
-    SetWebGPUPort(IpcReceiver<WebGPUMsg>),
-    /// The compositor scrolled and is updating the scroll states of the nodes in the given
+    #[cfg(feature = "webgpu")]
+    SetWebGPUPort(GenericReceiver<WebGPUMsg>),
+    /// `Paint` scrolled and is updating the scroll states of the nodes in the given
     /// pipeline via the Constellation.
-    SetScrollStates(PipelineId, Vec<ScrollState>),
-    /// Send the paint time for a specific epoch.
-    SetEpochPaintTime(PipelineId, Epoch, u64),
+    SetScrollStates(PipelineId, ScrollStateUpdate),
+    /// Evaluate the given JavaScript and return a result via a corresponding message
+    /// to the Constellation.
+    EvaluateJavaScript(WebViewId, PipelineId, JavaScriptEvaluationId, String),
+    /// A new batch of keys for the image cache for the specific pipeline.
+    SendImageKeysBatch(PipelineId, Vec<ImageKey>),
+    /// Preferences were updated in the parent process.
+    PreferencesUpdated(Vec<(String, PrefValue)>),
+    /// Notify the `ScriptThread` that the Servo renderer is no longer waiting on
+    /// asynchronous image uploads for the given `Pipeline`. These are mainly used
+    /// by canvas to perform uploads while the display list is being built.
+    NoLongerWaitingOnAsychronousImageUpdates(PipelineId),
+    /// Forward a keyboard scroll operation from an `<iframe>` to a parent pipeline.
+    ForwardKeyboardScroll(PipelineId, KeyboardScroll),
+    /// Request readiness for a screenshot from the given pipeline. The pipeline will
+    /// respond when it is ready to take the screenshot or will not be able to take it
+    /// in the future.
+    RequestScreenshotReadiness(WebViewId, PipelineId),
+    /// A response to a request to show an embedder user interface control.
+    EmbedderControlResponse(EmbedderControlId, EmbedderControlResponse),
+    /// Set the `UserContents` for the given `UserContentManagerId`. A `ScriptThread` can host many
+    /// `WebView`s which share the same `UserContentManager`. Only documents loaded after
+    /// the processing of this message will observe the new `UserContents` of the specified
+    /// `UserContentManagerId`.
+    SetUserContents(UserContentManagerId, UserContents),
+    /// Release all data for the given `UserContentManagerId` from the `ScriptThread`'s
+    /// `user_contents_for_manager_id` map.
+    DestroyUserContentManager(UserContentManagerId),
+    /// Update the pinch zoom details of a pipeline. Each `Window` stores a `VisualViewport` DOM
+    /// instance that gets updated according to the changes from the `Compositor``.
+    UpdatePinchZoomInfos(PipelineId, PinchZoomInfos),
+    /// Activate or deactivate accessibility features for the given pipeline, assuming it represents
+    /// a document.
+    ///
+    /// Why only one pipeline? In the Servo API, accessibility is activated on a per-webview basis,
+    /// and webviews have a simple one-to-many mapping to pipelines that represent documents. But
+    /// those pipelines run in script threads, which complicates things: the pipelines in a webview
+    /// may be split across multiple script threads, and the pipelines in a script thread may belong
+    /// to multiple webviews. So the simplest approach is to activate it for one pipeline at a time.
+    SetAccessibilityActive(PipelineId, bool, Epoch),
+    /// Forward the given [`accesskit::ActionRequest`] to the given pipeline.
+    ForwardAccessibilityAction(PipelineId, ActionRequest),
+    /// Force a garbage collection in this script thread.
+    TriggerGarbageCollection,
+    /// Inform the `ScriptThread` that the embedder has indicated that the network has gone
+    /// online or offline.
+    SetNetworkOnlineState(bool),
 }
 
-impl fmt::Debug for ConstellationControlMsg {
+impl fmt::Debug for ScriptThreadMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        use self::ConstellationControlMsg::*;
-        let variant = match *self {
-            StopDelayingLoadEventsMode(..) => "StopDelayingLoadsEventMode",
-            NavigationResponse(..) => "NavigationResponse",
-            AttachLayout(..) => "AttachLayout",
-            Resize(..) => "Resize",
-            ResizeInactive(..) => "ResizeInactive",
-            UnloadDocument(..) => "UnloadDocument",
-            ExitPipeline(..) => "ExitPipeline",
-            ExitScriptThread => "ExitScriptThread",
-            SendEvent(..) => "SendEvent",
-            Viewport(..) => "Viewport",
-            GetTitle(..) => "GetTitle",
-            SetDocumentActivity(..) => "SetDocumentActivity",
-            SetThrottled(..) => "SetThrottled",
-            SetThrottledInContainingIframe(..) => "SetThrottledInContainingIframe",
-            NavigateIframe(..) => "NavigateIframe",
-            PostMessage { .. } => "PostMessage",
-            UpdatePipelineId(..) => "UpdatePipelineId",
-            UpdateHistoryState(..) => "UpdateHistoryState",
-            RemoveHistoryStates(..) => "RemoveHistoryStates",
-            FocusIFrame(..) => "FocusIFrame",
-            WebDriverScriptCommand(..) => "WebDriverScriptCommand",
-            TickAllAnimations(..) => "TickAllAnimations",
-            WebFontLoaded(..) => "WebFontLoaded",
-            DispatchIFrameLoadEvent { .. } => "DispatchIFrameLoadEvent",
-            DispatchStorageEvent(..) => "DispatchStorageEvent",
-            ReportCSSError(..) => "ReportCSSError",
-            Reload(..) => "Reload",
-            PaintMetric(..) => "PaintMetric",
-            ExitFullScreen(..) => "ExitFullScreen",
-            MediaSessionAction(..) => "MediaSessionAction",
-            SetWebGPUPort(..) => "SetWebGPUPort",
-            SetScrollStates(..) => "SetScrollStates",
-            SetEpochPaintTime(..) => "SetEpochPaintTime",
-        };
-        write!(formatter, "ConstellationControlMsg::{}", variant)
+        let variant_string: &'static str = self.into();
+        write!(formatter, "ConstellationControlMsg::{variant_string}")
     }
 }
 
@@ -435,433 +373,148 @@ pub enum DocumentState {
     Pending,
 }
 
-/// For a given pipeline, whether any animations are currently running
-/// and any animation callbacks are queued
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum AnimationState {
-    /// Animations are active but no callbacks are queued
-    AnimationsPresent,
-    /// Animations are active and callbacks are queued
-    AnimationCallbacksPresent,
-    /// No animations are active and no callbacks are queued
-    NoAnimationsPresent,
-    /// No animations are active but callbacks are queued
-    NoAnimationCallbacksPresent,
+bitflags! {
+    #[derive(Clone, Copy, Default, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-buttons>
+    pub struct MouseButtons: u16 {
+        /// > 1 MUST indicate the primary button of the device (in general, the left
+        /// > button or the only button on single-button devices, used to activate a user
+        /// > interface control or select text).
+        const Primary = 1;
+        /// > 2 MUST indicate the secondary button (in general, the right button, often
+        /// > used to display a context menu), if present.
+        const Secondary = 2;
+        /// > 4 MUST indicate the auxiliary button (in general, the middle button, often
+        /// > combined with a mouse wheel).
+        const Auxiliary = 4;
+        /// The 'back' button:
+        ///
+        /// > Some pointing devices provide or simulate more buttons. To represent such
+        /// > buttons, the value MUST be doubled for each successive button (in the binary
+        /// > series 8, 16, 32, ... ).
+        const Back = 8;
+        /// The 'forward' button:
+        ///
+        /// > Some pointing devices provide or simulate more buttons. To represent such
+        /// > buttons, the value MUST be doubled for each successive button (in the binary
+        /// > series 8, 16, 32, ... ).
+        const Forward = 16;
+    }
 }
 
-/// The type of input represented by a multi-touch event.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub enum TouchEventType {
-    /// A new touch point came in contact with the screen.
-    Down,
-    /// An existing touch point changed location.
-    Move,
-    /// A touch point was removed from the screen.
-    Up,
-    /// The system stopped tracking a touch point.
-    Cancel,
+impl MouseButtons {
+    /// Returns whether exactly one button is pressed.
+    pub fn exactly_one_button_pressed(&self) -> bool {
+        // Exactly one button is pressed iff mouse_button_state is a power of 2
+        !self.is_empty() && (self.bits() & (self.bits() - 1)) == 0
+    }
 }
 
-/// An opaque identifier for a touch point.
-///
-/// <http://w3c.github.io/touch-events/#widl-Touch-identifier>
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TouchId(pub i32);
+malloc_size_of_is_0!(MouseButtons);
 
-/// The mouse button involved in the event.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub enum MouseButton {
-    /// The left mouse button.
-    Left = 1,
-    /// The right mouse button.
-    Right = 2,
-    /// The middle mouse button.
-    Middle = 4,
-}
+impl TryFrom<MouseButton> for MouseButtons {
+    type Error = ();
 
-/// The types of mouse events
-#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
-pub enum MouseEventType {
-    /// Mouse button clicked
-    Click,
-    /// Mouse button down
-    MouseDown,
-    /// Mouse button up
-    MouseUp,
-}
-
-/// Mode to measure WheelDelta floats in
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub enum WheelMode {
-    /// Delta values are specified in pixels
-    DeltaPixel = 0x00,
-    /// Delta values are specified in lines
-    DeltaLine = 0x01,
-    /// Delta values are specified in pages
-    DeltaPage = 0x02,
-}
-
-/// The Wheel event deltas in every direction
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct WheelDelta {
-    /// Delta in the left/right direction
-    pub x: f64,
-    /// Delta in the up/down direction
-    pub y: f64,
-    /// Delta in the direction going into/out of the screen
-    pub z: f64,
-    /// Mode to measure the floats in
-    pub mode: WheelMode,
-}
-
-/// Events from the compositor that the script thread needs to know about
-#[derive(Debug, Deserialize, Serialize)]
-pub enum CompositorEvent {
-    /// The window was resized.
-    ResizeEvent(WindowSizeData, WindowSizeType),
-    /// A mouse button state changed.
-    MouseButtonEvent(
-        MouseEventType,
-        MouseButton,
-        Point2D<f32>,
-        Option<UntrustedNodeAddress>,
-        Option<Point2D<f32>>,
-        // Bitmask of MouseButton values representing the currently pressed buttons
-        u16,
-    ),
-    /// The mouse was moved over a point (or was moved out of the recognizable region).
-    MouseMoveEvent(
-        Point2D<f32>,
-        Option<UntrustedNodeAddress>,
-        // Bitmask of MouseButton values representing the currently pressed buttons
-        u16,
-    ),
-    /// A touch event was generated with a touch ID and location.
-    TouchEvent(
-        TouchEventType,
-        TouchId,
-        Point2D<f32>,
-        Option<UntrustedNodeAddress>,
-    ),
-    /// A wheel event was generated with a delta in the X, Y, and/or Z directions
-    WheelEvent(WheelDelta, Point2D<f32>, Option<UntrustedNodeAddress>),
-    /// A key was pressed.
-    KeyboardEvent(KeyboardEvent),
-    /// An event from the IME is dispatched.
-    CompositionEvent(CompositionEvent),
-    /// Virtual keyboard was dismissed
-    IMEDismissedEvent,
-    /// Connected gamepad state updated
-    GamepadEvent(GamepadEvent),
-}
-
-impl From<&CompositorEvent> for CompositorEventVariant {
-    fn from(value: &CompositorEvent) -> Self {
-        match value {
-            CompositorEvent::ResizeEvent(..) => CompositorEventVariant::ResizeEvent,
-            CompositorEvent::MouseButtonEvent(..) => CompositorEventVariant::MouseButtonEvent,
-            CompositorEvent::MouseMoveEvent(..) => CompositorEventVariant::MouseMoveEvent,
-            CompositorEvent::TouchEvent(..) => CompositorEventVariant::TouchEvent,
-            CompositorEvent::WheelEvent(..) => CompositorEventVariant::WheelEvent,
-            CompositorEvent::KeyboardEvent(..) => CompositorEventVariant::KeyboardEvent,
-            CompositorEvent::CompositionEvent(..) => CompositorEventVariant::CompositionEvent,
-            CompositorEvent::IMEDismissedEvent => CompositorEventVariant::IMEDismissedEvent,
-            CompositorEvent::GamepadEvent(..) => CompositorEventVariant::GamepadEvent,
+    fn try_from(button: MouseButton) -> Result<Self, Self::Error> {
+        match button {
+            MouseButton::Primary => Ok(Self::Primary),
+            MouseButton::Secondary => Ok(Self::Secondary),
+            MouseButton::Auxiliary => Ok(Self::Auxiliary),
+            MouseButton::Back => Ok(Self::Back),
+            MouseButton::Forward => Ok(Self::Forward),
+            MouseButton::None | MouseButton::Other(_) => Err(()),
         }
     }
 }
 
-/// Requests a TimerEvent-Message be sent after the given duration.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TimerEventRequest(
-    pub IpcSender<TimerEvent>,
-    pub TimerSource,
-    pub TimerEventId,
-    pub MsDuration,
-);
-
-/// The message used to send a request to the timer scheduler.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TimerSchedulerMsg(pub TimerEventRequest);
-
-/// Notifies the script thread to fire due timers.
-/// `TimerSource` must be `FromWindow` when dispatched to `ScriptThread` and
-/// must be `FromWorker` when dispatched to a `DedicatedGlobalWorkerScope`
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TimerEvent(pub TimerSource, pub TimerEventId);
-
-/// Describes the thread that requested the TimerEvent.
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
-pub enum TimerSource {
-    /// The event was requested from a window (ScriptThread).
-    FromWindow(PipelineId),
-    /// The event was requested from a worker (DedicatedGlobalWorkerScope).
-    FromWorker,
+/// Input events from the embedder that are sent via the `Constellation`` to the `ScriptThread`.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct ConstellationInputEvent {
+    /// The hit test result of this input event, if any.
+    pub hit_test_result: Option<PaintHitTestResult>,
+    /// The pressed mouse button state of the constellation when this input
+    /// event was triggered.
+    pub pressed_mouse_buttons: MouseButtons,
+    /// The currently active keyboard modifiers.
+    pub active_keyboard_modifiers: Modifiers,
+    /// The [`InputEventAndId`] itself.
+    pub event: InputEventAndId,
 }
 
-/// The id to be used for a `TimerEvent` is defined by the corresponding `TimerEventRequest`.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
-pub struct TimerEventId(pub u32);
+impl ConstellationInputEvent {
+    /// Returns whether `pressed_mouse_buttons` includes the primary button
+    pub fn primary_button_is_pressed(&self) -> bool {
+        self.pressed_mouse_buttons.contains(MouseButtons::Primary)
+    }
 
-/// Unit of measurement.
-#[derive(Clone, Copy, MallocSizeOf)]
-pub enum Milliseconds {}
-/// Unit of measurement.
-#[derive(Clone, Copy, MallocSizeOf)]
-pub enum Nanoseconds {}
+    /// Returns whether `pressed_mouse_buttons` includes the auxiliary (middle) button
+    pub fn auxiliary_button_is_pressed(&self) -> bool {
+        self.pressed_mouse_buttons.contains(MouseButtons::Auxiliary)
+    }
 
-/// Amount of milliseconds.
-pub type MsDuration = Length<u64, Milliseconds>;
-/// Amount of nanoseconds.
-pub type NsDuration = Length<u64, Nanoseconds>;
-
-/// Returns the duration since an unspecified epoch measured in ms.
-pub fn precise_time_ms() -> MsDuration {
-    Length::new(time::precise_time_ns() / (1000 * 1000))
-}
-
-/// Data needed to construct a script thread.
-///
-/// NB: *DO NOT* add any Senders or Receivers here! pcwalton will have to rewrite your code if you
-/// do! Use IPC senders and receivers instead.
-pub struct InitialScriptState {
-    /// The ID of the pipeline with which this script thread is associated.
-    pub id: PipelineId,
-    /// The subpage ID of this pipeline to create in its pipeline parent.
-    /// If `None`, this is the root.
-    pub parent_info: Option<PipelineId>,
-    /// The ID of the browsing context this script is part of.
-    pub browsing_context_id: BrowsingContextId,
-    /// The ID of the top-level browsing context this script is part of.
-    pub top_level_browsing_context_id: TopLevelBrowsingContextId,
-    /// The ID of the opener, if any.
-    pub opener: Option<BrowsingContextId>,
-    /// Loading into a Secure Context
-    pub inherited_secure_context: Option<bool>,
-    /// A channel with which messages can be sent to us (the script thread).
-    pub control_chan: IpcSender<ConstellationControlMsg>,
-    /// A port on which messages sent by the constellation to script can be received.
-    pub control_port: IpcReceiver<ConstellationControlMsg>,
-    /// A channel on which messages can be sent to the constellation from script.
-    pub script_to_constellation_chan: ScriptToConstellationChan,
-    /// A handle to register script-(and associated layout-)threads for hang monitoring.
-    pub background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
-    /// A sender layout to communicate to the constellation.
-    pub layout_to_constellation_chan: IpcSender<LayoutMsg>,
-    /// A channel to schedule timer events.
-    pub scheduler_chan: IpcSender<TimerSchedulerMsg>,
-    /// A channel to the resource manager thread.
-    pub resource_threads: ResourceThreads,
-    /// A channel to the bluetooth thread.
-    pub bluetooth_thread: IpcSender<BluetoothRequest>,
-    /// The image cache for this script thread.
-    pub image_cache: Arc<dyn ImageCache>,
-    /// A channel to the time profiler thread.
-    pub time_profiler_chan: profile_traits::time::ProfilerChan,
-    /// A channel to the memory profiler thread.
-    pub mem_profiler_chan: mem::ProfilerChan,
-    /// A channel to the developer tools, if applicable.
-    pub devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
-    /// Information about the initial window size.
-    pub window_size: WindowSizeData,
-    /// The ID of the pipeline namespace for this script thread.
-    pub pipeline_namespace_id: PipelineNamespaceId,
-    /// A ping will be sent on this channel once the script thread shuts down.
-    pub content_process_shutdown_chan: Sender<()>,
-    /// A channel to the WebGL thread used in this pipeline.
-    pub webgl_chan: Option<WebGLPipeline>,
-    /// The XR device registry
-    pub webxr_registry: webxr_api::Registry,
-    /// The Webrender document ID associated with this thread.
-    pub webrender_document: DocumentId,
-    /// FIXME(victor): The Webrender API sender in this constellation's pipeline
-    pub webrender_api_sender: WebRenderScriptApi,
-    /// Application window's GL Context for Media player
-    pub player_context: WindowGLContext,
-}
-
-/// This trait allows creating a `ServiceWorkerManager` without depending on the `script`
-/// crate.
-pub trait ServiceWorkerManagerFactory {
-    /// Create a `ServiceWorkerManager`.
-    fn create(sw_senders: SWManagerSenders, origin: ImmutableOrigin);
-}
-
-/// Whether the sandbox attribute is present for an iframe element
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IFrameSandboxState {
-    /// Sandbox attribute is present
-    IFrameSandboxed,
-    /// Sandbox attribute is not present
-    IFrameUnsandboxed,
-}
-
-/// Specifies the information required to load an auxiliary browsing context.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct AuxiliaryBrowsingContextLoadInfo {
-    /// Load data containing the url to load
-    pub load_data: LoadData,
-    /// The pipeline opener browsing context.
-    pub opener_pipeline_id: PipelineId,
-    /// The new top-level ID for the auxiliary.
-    pub new_top_level_browsing_context_id: TopLevelBrowsingContextId,
-    /// The new browsing context ID.
-    pub new_browsing_context_id: BrowsingContextId,
-    /// The new pipeline ID for the auxiliary.
-    pub new_pipeline_id: PipelineId,
-}
-
-/// Specifies the information required to load an iframe.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct IFrameLoadInfo {
-    /// Pipeline ID of the parent of this iframe
-    pub parent_pipeline_id: PipelineId,
-    /// The ID for this iframe's nested browsing context.
-    pub browsing_context_id: BrowsingContextId,
-    /// The ID for the top-level ancestor browsing context of this iframe's nested browsing context.
-    pub top_level_browsing_context_id: TopLevelBrowsingContextId,
-    /// The new pipeline ID that the iframe has generated.
-    pub new_pipeline_id: PipelineId,
-    ///  Whether this iframe should be considered private
-    pub is_private: bool,
-    ///  Whether this iframe should be considered secure
-    pub inherited_secure_context: Option<bool>,
-    /// Wether this load should replace the current entry (reload). If true, the current
-    /// entry will be replaced instead of a new entry being added.
-    pub replace: HistoryEntryReplacement,
-}
-
-/// Specifies the information required to load a URL in an iframe.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct IFrameLoadInfoWithData {
-    /// The information required to load an iframe.
-    pub info: IFrameLoadInfo,
-    /// Load data containing the url to load
-    pub load_data: LoadData,
-    /// The old pipeline ID for this iframe, if a page was previously loaded.
-    pub old_pipeline_id: Option<PipelineId>,
-    /// Sandbox type of this iframe
-    pub sandbox: IFrameSandboxState,
-    /// The initial viewport size for this iframe.
-    pub window_size: WindowSizeData,
-}
-
-bitflags! {
-    #[derive(Default, Deserialize, Serialize)]
-    /// Specifies if rAF should be triggered and/or CSS Animations and Transitions.
-    pub struct AnimationTickType: u8 {
-        /// Trigger a call to requestAnimationFrame.
-        const REQUEST_ANIMATION_FRAME = 0b001;
-        /// Trigger restyles for CSS Animations and Transitions.
-        const CSS_ANIMATIONS_AND_TRANSITIONS = 0b010;
+    /// Returns whether this is a compatibility mouse event synthesized for a touch.
+    pub fn is_compatibility_event_for_touch(&self) -> bool {
+        match self.event.event {
+            InputEvent::MouseMove(ref event) => event.is_compatibility_event_for_touch,
+            InputEvent::MouseButton(ref event) => event.is_compatibility_event_for_touch,
+            _ => false,
+        }
     }
 }
 
-/// The scroll state of a stacking context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ScrollState {
-    /// The ID of the scroll root.
-    pub scroll_id: ExternalScrollId,
-    /// The scrolling offset of this stacking context.
-    pub scroll_offset: Vector2D<f32, LayoutPixel>,
-}
-
-/// Data about the window size.
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub struct WindowSizeData {
-    /// The size of the initial layout viewport, before parsing an
-    /// <http://www.w3.org/TR/css-device-adapt/#initial-viewport>
-    pub initial_viewport: Size2D<f32, CSSPixel>,
-
-    /// The resolution of the window in dppx, not including any "pinch zoom" factor.
-    pub device_pixel_ratio: Scale<f32, CSSPixel, DevicePixel>,
-}
-
-/// The type of window size change.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
-pub enum WindowSizeType {
-    /// Initial load.
-    Initial,
-    /// Window resize.
-    Resize,
-}
-
-/// Messages to the constellation originating from the WebDriver server.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum WebDriverCommandMsg {
-    /// Get the window size.
-    GetWindowSize(TopLevelBrowsingContextId, IpcSender<WindowSizeData>),
-    /// Load a URL in the top-level browsing context with the given ID.
-    LoadUrl(TopLevelBrowsingContextId, LoadData, IpcSender<LoadStatus>),
-    /// Refresh the top-level browsing context with the given ID.
-    Refresh(TopLevelBrowsingContextId, IpcSender<LoadStatus>),
-    /// Pass a webdriver command to the script thread of the current pipeline
-    /// of a browsing context.
-    ScriptCommand(BrowsingContextId, WebDriverScriptCommand),
-    /// Act as if keys were pressed in the browsing context with the given ID.
-    SendKeys(BrowsingContextId, Vec<WebDriverInputEvent>),
-    /// Act as if keys were pressed or release in the browsing context with the given ID.
-    KeyboardAction(BrowsingContextId, KeyboardEvent),
-    /// Act as if the mouse was clicked in the browsing context with the given ID.
-    MouseButtonAction(MouseEventType, MouseButton, f32, f32),
-    /// Act as if the mouse was moved in the browsing context with the given ID.
-    MouseMoveAction(f32, f32),
-    /// Set the window size.
-    SetWindowSize(
-        TopLevelBrowsingContextId,
-        DeviceIntSize,
-        IpcSender<WindowSizeData>,
-    ),
-    /// Take a screenshot of the window.
-    TakeScreenshot(
-        TopLevelBrowsingContextId,
-        Option<Rect<f32, CSSPixel>>,
-        IpcSender<Option<Image>>,
-    ),
-}
-
-/// Resources required by workerglobalscopes
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WorkerGlobalScopeInit {
-    /// Chan to a resource thread
+/// All of the information necessary to create a new [`ScriptThread`] for a new [`EventLoop`].
+///
+/// NB: *DO NOT* add any Senders or Receivers here! pcwalton will have to rewrite your code if you
+/// do! Use IPC senders and receivers instead.
+#[derive(Deserialize, Serialize)]
+pub struct InitialScriptState {
+    /// The id of the script event loop that this state will start. This is used to uniquely
+    /// identify an event loop.
+    pub id: ScriptEventLoopId,
+    /// The sender to use to install the `Pipeline` namespace into this process (if necessary).
+    pub namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
+    /// A channel with which messages can be sent to us (the script thread).
+    pub constellation_to_script_sender: GenericSender<ScriptThreadMessage>,
+    /// A port on which messages sent by the constellation to script can be received.
+    pub constellation_to_script_receiver: GenericReceiver<ScriptThreadMessage>,
+    /// A channel on which messages can be sent to the constellation from script.
+    pub script_to_constellation_sender: ScriptToConstellationSender,
+    /// A channel which allows script to send messages directly to the Embedder
+    /// This will pump the embedder event loop.
+    pub script_to_embedder_sender: ScriptToEmbedderChan,
+    /// An IpcSender to the `SystemFontService` used to create a `SystemFontServiceProxy`.
+    pub system_font_service: SystemFontServiceProxySender,
+    /// A channel to the resource manager thread.
     pub resource_threads: ResourceThreads,
-    /// Chan to the memory profiler
-    pub mem_profiler_chan: mem::ProfilerChan,
-    /// Chan to the time profiler
-    pub time_profiler_chan: profile_time::ProfilerChan,
-    /// To devtools sender
-    pub to_devtools_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
-    /// From devtools sender
-    pub from_devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
-    /// Messages to send to constellation
-    pub script_to_constellation_chan: ScriptToConstellationChan,
-    /// Message to send to the scheduler
-    pub scheduler_chan: IpcSender<TimerSchedulerMsg>,
-    /// The worker id
-    pub worker_id: WorkerId,
-    /// The pipeline id
-    pub pipeline_id: PipelineId,
-    /// The origin
-    pub origin: ImmutableOrigin,
-    /// The creation URL
-    pub creation_url: Option<ServoUrl>,
-    /// True if headless mode
-    pub is_headless: bool,
-    /// An optional string allowing the user agnet to be set for testing.
-    pub user_agent: Cow<'static, str>,
-    /// True if secure context
-    pub inherited_secure_context: Option<bool>,
-}
-
-/// Common entities representing a network load origin
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WorkerScriptLoadOrigin {
-    /// referrer url
-    pub referrer_url: Option<ServoUrl>,
-    /// the referrer policy which is used
-    pub referrer_policy: Option<ReferrerPolicy>,
-    /// the pipeline id of the entity requesting the load
-    pub pipeline_id: PipelineId,
+    /// A channel to the storage manager thread.
+    pub storage_threads: StorageThreads,
+    /// A channel to the bluetooth thread.
+    #[cfg(feature = "bluetooth")]
+    pub bluetooth_sender: GenericSender<BluetoothRequest>,
+    /// A channel to the time profiler thread.
+    pub time_profiler_sender: profile_traits::time::ProfilerChan,
+    /// A channel to the memory profiler thread.
+    pub memory_profiler_sender: mem::ProfilerChan,
+    /// A channel to the developer tools, if applicable.
+    #[cfg(feature = "devtools")]
+    pub devtools_server_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
+    /// The ID of the pipeline namespace for this script thread.
+    pub pipeline_namespace_id: PipelineNamespaceId,
+    /// A channel to the WebGL thread used in this pipeline.
+    #[cfg(feature = "webgl")]
+    pub webgl_chan: Option<WebGLPipeline>,
+    /// The XR device registry
+    pub webxr_registry: Option<webxr_api::Registry>,
+    /// Access to `Paint` across a process boundary.
+    pub cross_process_paint_api: CrossProcessPaintApi,
+    /// Application window's GL Context for Media player
+    pub player_context: WindowGLContext,
+    /// A list of URLs that can access privileged internal APIs.
+    pub privileged_urls: Vec<ServoUrl>,
+    /// A copy of constellation's `UserContentManagerId` to `UserContents` map.
+    pub user_contents_for_manager_id: FxHashMap<UserContentManagerId, UserContents>,
+    /// Whether or not the embedder has indicated that networking is online.
+    pub online: bool,
 }
 
 /// Errors from executing a paint worklet
@@ -914,205 +567,4 @@ pub struct DrawAPaintImageResult {
     pub image_key: Option<ImageKey>,
     /// Drawing the image might have requested loading some image URLs.
     pub missing_image_urls: Vec<ServoUrl>,
-}
-
-/// A Script to Constellation channel.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ScriptToConstellationChan {
-    /// Sender for communicating with constellation thread.
-    pub sender: IpcSender<(PipelineId, ScriptMsg)>,
-    /// Used to identify the origin of the message.
-    pub pipeline_id: PipelineId,
-}
-
-impl ScriptToConstellationChan {
-    /// Send ScriptMsg and attach the pipeline_id to the message.
-    pub fn send(&self, msg: ScriptMsg) -> Result<(), IpcError> {
-        self.sender.send((self.pipeline_id, msg))
-    }
-}
-
-/// A data-holder for serialized data and transferred objects.
-/// <https://html.spec.whatwg.org/multipage/#structuredserializewithtransfer>
-#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
-pub struct StructuredSerializedData {
-    /// Data serialized by SpiderMonkey.
-    pub serialized: Vec<u8>,
-    /// Serialized in a structured callback,
-    pub blobs: Option<HashMap<BlobId, BlobImpl>>,
-    /// Transferred objects.
-    pub ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
-}
-
-impl StructuredSerializedData {
-    /// Clone the serialized data for use with broadcast-channels.
-    pub fn clone_for_broadcast(&self) -> StructuredSerializedData {
-        let serialized = self.serialized.clone();
-
-        let blobs = if let Some(blobs) = self.blobs.as_ref() {
-            let mut blob_clones = HashMap::with_capacity(blobs.len());
-
-            for (original_id, blob) in blobs.iter() {
-                let type_string = blob.type_string();
-
-                if let BlobData::Memory(ref bytes) = blob.blob_data() {
-                    let blob_clone = BlobImpl::new_from_bytes(bytes.clone(), type_string);
-
-                    // Note: we insert the blob at the original id,
-                    // otherwise this will not match the storage key as serialized by SM in `serialized`.
-                    // The clone has it's own new Id however.
-                    blob_clones.insert(*original_id, blob_clone);
-                } else {
-                    // Not panicking only because this is called from the constellation.
-                    warn!("Serialized blob not in memory format(should never happen).");
-                }
-            }
-            Some(blob_clones)
-        } else {
-            None
-        };
-
-        if self.ports.is_some() {
-            // Not panicking only because this is called from the constellation.
-            warn!("Attempt to broadcast structured serialized data including ports(should never happen).");
-        }
-
-        StructuredSerializedData {
-            serialized,
-            blobs,
-            // Ports cannot be broadcast.
-            ports: None,
-        }
-    }
-}
-
-/// A task on the <https://html.spec.whatwg.org/multipage/#port-message-queue>
-#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
-pub struct PortMessageTask {
-    /// The origin of this task.
-    pub origin: ImmutableOrigin,
-    /// A data-holder for serialized data and transferred objects.
-    pub data: StructuredSerializedData,
-}
-
-/// Messages for communication between the constellation and a global managing ports.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum MessagePortMsg {
-    /// Complete the transfer for a batch of ports.
-    CompleteTransfer(HashMap<MessagePortId, VecDeque<PortMessageTask>>),
-    /// Complete the transfer of a single port,
-    /// whose transfer was pending because it had been requested
-    /// while a previous failed transfer was being rolled-back.
-    CompletePendingTransfer(MessagePortId, VecDeque<PortMessageTask>),
-    /// Remove a port, the entangled one doesn't exists anymore.
-    RemoveMessagePort(MessagePortId),
-    /// Handle a new port-message-task.
-    NewTask(MessagePortId, PortMessageTask),
-}
-
-/// Message for communication between the constellation and a global managing broadcast channels.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct BroadcastMsg {
-    /// The origin of this message.
-    pub origin: ImmutableOrigin,
-    /// The name of the channel.
-    pub channel_name: String,
-    /// A data-holder for serialized data.
-    pub data: StructuredSerializedData,
-}
-
-impl Clone for BroadcastMsg {
-    fn clone(&self) -> BroadcastMsg {
-        BroadcastMsg {
-            data: self.data.clone_for_broadcast(),
-            origin: self.origin.clone(),
-            channel_name: self.channel_name.clone(),
-        }
-    }
-}
-
-/// The type of MediaSession action.
-/// <https://w3c.github.io/mediasession/#enumdef-mediasessionaction>
-#[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub enum MediaSessionActionType {
-    /// The action intent is to resume playback.
-    Play,
-    /// The action intent is to pause the currently active playback.
-    Pause,
-    /// The action intent is to move the playback time backward by a short period (i.e. a few
-    /// seconds).
-    SeekBackward,
-    /// The action intent is to move the playback time forward by a short period (i.e. a few
-    /// seconds).
-    SeekForward,
-    /// The action intent is to either start the current playback from the beginning if the
-    /// playback has a notion, of beginning, or move to the previous item in the playlist if the
-    /// playback has a notion of playlist.
-    PreviousTrack,
-    /// The action is to move to the playback to the next item in the playlist if the playback has
-    /// a notion of playlist.
-    NextTrack,
-    /// The action intent is to skip the advertisement that is currently playing.
-    SkipAd,
-    /// The action intent is to stop the playback and clear the state if appropriate.
-    Stop,
-    /// The action intent is to move the playback time to a specific time.
-    SeekTo,
-}
-
-impl From<i32> for MediaSessionActionType {
-    fn from(value: i32) -> MediaSessionActionType {
-        match value {
-            1 => MediaSessionActionType::Play,
-            2 => MediaSessionActionType::Pause,
-            3 => MediaSessionActionType::SeekBackward,
-            4 => MediaSessionActionType::SeekForward,
-            5 => MediaSessionActionType::PreviousTrack,
-            6 => MediaSessionActionType::NextTrack,
-            7 => MediaSessionActionType::SkipAd,
-            8 => MediaSessionActionType::Stop,
-            9 => MediaSessionActionType::SeekTo,
-            _ => panic!("Unknown MediaSessionActionType"),
-        }
-    }
-}
-
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
-)]
-/// Index of gamepad in list of system's connected gamepads
-pub struct GamepadIndex(pub usize);
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// The minimum and maximum values that can be reported for axis or button input from this gamepad
-pub struct GamepadInputBounds {
-    /// Minimum and maximum axis values
-    pub axis_bounds: (f64, f64),
-    /// Minimum and maximum button values
-    pub button_bounds: (f64, f64),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// The type of Gamepad event
-pub enum GamepadEvent {
-    /// A new gamepad has been connected
-    /// <https://www.w3.org/TR/gamepad/#event-gamepadconnected>
-    Connected(GamepadIndex, String, GamepadInputBounds),
-    /// An existing gamepad has been disconnected
-    /// <https://www.w3.org/TR/gamepad/#event-gamepaddisconnected>
-    Disconnected(GamepadIndex),
-    /// An existing gamepad has been updated
-    /// <https://www.w3.org/TR/gamepad/#receiving-inputs>
-    Updated(GamepadIndex, GamepadUpdateType),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// The type of Gamepad input being updated
-pub enum GamepadUpdateType {
-    /// Axis index and input value
-    /// <https://www.w3.org/TR/gamepad/#dfn-represents-a-standard-gamepad-axis>
-    Axis(usize, f64),
-    /// Button index and input value
-    /// <https://www.w3.org/TR/gamepad/#dfn-represents-a-standard-gamepad-button>
-    Button(usize, f64),
 }

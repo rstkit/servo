@@ -3,23 +3,33 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::panic)]
 
 #[macro_use]
 mod tracing;
 
+mod broadcastchannel;
 mod browsingcontext;
 mod constellation;
+mod constellation_webview;
+mod embedder;
 mod event_loop;
 mod logging;
-mod network_listener;
 mod pipeline;
+#[cfg(feature = "multiprocess")]
+mod process_manager;
+#[cfg(feature = "multiprocess")]
 mod sandboxing;
+mod screenshot_readiness_request;
 mod serviceworker;
 mod session_history;
-mod timer_scheduler;
-mod webview;
 
 pub use crate::constellation::{Constellation, InitialConstellationState};
-pub use crate::logging::{FromCompositorLogger, FromScriptLogger};
-pub use crate::pipeline::UnprivilegedPipelineContent;
-pub use crate::sandboxing::{content_process_sandbox_profile, UnprivilegedContent};
+pub use crate::embedder::ConstellationToEmbedderMsg;
+pub use crate::event_loop::EventLoop;
+#[cfg(feature = "multiprocess")]
+pub use crate::event_loop::NewScriptEventLoopProcessInfo;
+pub use crate::logging::{FromEmbedderLogger, FromScriptLogger};
+#[cfg(feature = "multiprocess")]
+pub use crate::sandboxing::{UnprivilegedContent, content_process_sandbox_profile};

@@ -2,55 +2,34 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use base::text::{UnicodeBlock, UnicodeBlockMethod};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod};
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 use unicode_script::Script;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use crate::platform::freetype::{font, font_list, library_handle};
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
+use crate::FallbackFontSelectionOptions;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+pub use crate::platform::freetype::{font, font_list};
 #[cfg(target_os = "macos")]
 pub use crate::platform::macos::{core_text_font_cache, font, font_list};
 #[cfg(target_os = "windows")]
 pub use crate::platform::windows::{font, font_list};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::FallbackFontSelectionOptions;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod freetype {
-    use std::ffi::CStr;
-    use std::str;
-
-    use libc::c_char;
-
-    /// Creates a String from the given null-terminated buffer.
-    /// Panics if the buffer does not contain UTF-8.
-    unsafe fn c_str_to_string(s: *const c_char) -> String {
-        str::from_utf8(CStr::from_ptr(s).to_bytes())
-            .unwrap()
-            .to_owned()
-    }
-
-    pub mod font;
-
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    pub mod font_list;
-    #[cfg(target_os = "android")]
-    mod android {
-        pub mod font_list;
-        mod xml;
-    }
-    #[cfg(target_os = "android")]
-    pub use self::android::font_list;
-    #[cfg(target_env = "ohos")]
-    mod ohos {
-        pub mod font_list;
-    }
-    #[cfg(target_env = "ohos")]
-    pub use self::ohos::font_list;
-
-    pub mod library_handle;
-}
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+pub mod freetype;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -65,7 +44,11 @@ mod windows {
     pub mod font_list;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 pub(crate) fn add_noto_fallback_families(
     options: FallbackFontSelectionOptions,
     families: &mut Vec<&'static str>,

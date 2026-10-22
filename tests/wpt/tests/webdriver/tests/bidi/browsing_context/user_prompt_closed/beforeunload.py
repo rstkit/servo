@@ -1,4 +1,8 @@
+import asyncio
 import pytest
+
+import webdriver.bidi.error as error
+
 
 pytestmark = pytest.mark.asyncio
 
@@ -6,6 +10,7 @@ USER_PROMPT_CLOSED_EVENT = "browsingContext.userPromptClosed"
 USER_PROMPT_OPENED_EVENT = "browsingContext.userPromptOpened"
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'beforeUnload': 'ignore'}})
 @pytest.mark.parametrize("accept", [False, True])
 async def test_beforeunload(
     bidi_session,
@@ -22,12 +27,12 @@ async def test_beforeunload(
 
     on_entry = wait_for_event(USER_PROMPT_OPENED_EVENT)
 
-    await bidi_session.send_command(
-        "browsingContext.navigate",
-        {
-            "context": new_tab["context"],
-            "url": url("/webdriver/tests/support/html/default.html"),
-        },
+    navigated_future = asyncio.create_task(
+        bidi_session.browsing_context.navigate(
+            context=new_tab["context"],
+            url=url("/webdriver/tests/support/html/default.html"),
+            wait="none"
+        )
     )
 
     # Wait for prompt to appear.
@@ -44,4 +49,13 @@ async def test_beforeunload(
     assert event == {
         "context": new_tab["context"],
         "accepted": accept,
+        "type": "beforeunload",
+        **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
     }
+
+    # Wait for the navigation to finish or fail.
+    if accept:
+        await navigated_future
+    else:
+        with pytest.raises(error.UnknownErrorException):
+            await wait_for_future_safe(navigated_future)

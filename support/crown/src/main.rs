@@ -16,26 +16,31 @@ extern crate rustc_infer;
 extern crate rustc_interface;
 extern crate rustc_lint;
 extern crate rustc_log;
+extern crate rustc_macros;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
 
-use std::process::ExitCode;
+use std::path::Path;
 
 use rustc_driver::Callbacks;
 use rustc_interface::interface::Config;
 
 mod common;
 
+#[cfg(feature = "jscontext_first_arg")]
+mod jscontext_first_arg;
+
+#[cfg(feature = "manual_domstring_new")]
+mod manual_domstring_new;
+
 #[cfg(feature = "unrooted_must_root_lint")]
 mod unrooted_must_root;
 
 #[cfg(feature = "trace_in_no_trace_lint")]
 mod trace_in_no_trace;
-
-mod crown_is_not_used;
 
 struct MyCallbacks;
 
@@ -51,7 +56,10 @@ impl Callbacks for MyCallbacks {
                 return;
             }
 
-            crown_is_not_used::register(lint_store);
+            #[cfg(feature = "jscontext_first_arg")]
+            jscontext_first_arg::register(lint_store);
+            #[cfg(feature = "manual_domstring_new")]
+            manual_domstring_new::register(lint_store);
             #[cfg(feature = "unrooted_must_root_lint")]
             unrooted_must_root::register(lint_store);
             #[cfg(feature = "trace_in_no_trace_lint")]
@@ -60,14 +68,28 @@ impl Callbacks for MyCallbacks {
     }
 }
 
-fn main() -> ExitCode {
+/// The `crown` main function.
+///
+/// To run `crown` manually use:
+/// ```bash
+/// RUST_BACKTRACE=1 cargo run -- \
+///      "-Zcrate-attr=feature(register_tool)" \
+///      "-Zcrate-attr=register_tool(crown)" tests/...`
+/// ```
+fn main() {
     let handler =
         rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
     rustc_driver::init_logger(&handler, rustc_log::LoggerConfig::from_env("CROWN_LOG"));
-    let args: Vec<_> = std::env::args().collect();
+    let mut args: Vec<_> = std::env::args().collect();
 
-    match rustc_driver::RunCompiler::new(&args, &mut MyCallbacks).run() {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+    // Setting RUSTC_WRAPPER causes Cargo to pass 'rustc' as the first argument.
+    // We're invoking the compiler programmatically, so we ignore this
+    if args.get(1).map(Path::new).and_then(Path::file_stem) == Some("rustc".as_ref()) {
+        args.remove(1);
     }
+
+    // Pass cfg(crown) to rustc
+    args.extend(["--cfg".to_owned(), "crown".to_owned()]);
+
+    rustc_driver::run_compiler(&args, &mut MyCallbacks)
 }

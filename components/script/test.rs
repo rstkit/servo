@@ -3,27 +3,29 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // For compile-fail tests only.
-pub use crate::dom::bindings::cell::DomRefCell;
-pub use crate::dom::bindings::refcounted::TrustedPromise;
-pub use crate::dom::bindings::root::Dom;
+// pub use script_bindings::cell::DomRefCell;
+// pub use crate::dom::bindings::root::Dom;
 pub use crate::dom::bindings::str::{ByteString, DOMString};
-pub use crate::dom::headers::normalize_value;
-pub use crate::dom::node::Node;
+// pub use crate::dom::node::Node;
 
 pub mod area {
-    pub use crate::dom::htmlareaelement::{Area, Shape};
+    pub use crate::dom::html::htmlareaelement::{Area, Shape};
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod size_of {
     use std::mem::size_of;
 
     use crate::dom::characterdata::CharacterData;
     use crate::dom::element::Element;
+    use crate::dom::element::storage::ContentAttributeData;
     use crate::dom::eventtarget::EventTarget;
-    use crate::dom::htmldivelement::HTMLDivElement;
-    use crate::dom::htmlelement::HTMLElement;
-    use crate::dom::htmlspanelement::HTMLSpanElement;
+    use crate::dom::html::htmldivelement::HTMLDivElement;
+    use crate::dom::html::htmlelement::HTMLElement;
+    use crate::dom::html::htmlimageelement::HTMLImageElement;
+    use crate::dom::html::htmlscriptelement::HTMLScriptElement;
+    use crate::dom::html::htmlspanelement::HTMLSpanElement;
+    use crate::dom::html::htmlvideoelement::HTMLVideoElement;
     use crate::dom::node::Node;
     use crate::dom::text::Text;
 
@@ -47,8 +49,20 @@ pub mod size_of {
         size_of::<HTMLElement>()
     }
 
+    pub fn HTMLImageElement() -> usize {
+        size_of::<HTMLImageElement>()
+    }
+
+    pub fn HTMLScriptElement() -> usize {
+        size_of::<HTMLScriptElement>()
+    }
+
     pub fn HTMLSpanElement() -> usize {
         size_of::<HTMLSpanElement>()
+    }
+
+    pub fn HTMLVideoElement() -> usize {
+        size_of::<HTMLVideoElement>()
     }
 
     pub fn Node() -> usize {
@@ -58,12 +72,35 @@ pub mod size_of {
     pub fn Text() -> usize {
         size_of::<Text>()
     }
+
+    pub fn ContentAttributeData() -> usize {
+        size_of::<ContentAttributeData>()
+    }
 }
 
 pub mod srcset {
-    pub use crate::dom::htmlimageelement::{parse_a_srcset_attribute, Descriptor, ImageSource};
+    pub use crate::dom::srcset::{Descriptor, ImageSource, parse_a_srcset_attribute};
 }
 
 pub mod timeranges {
     pub use crate::dom::timeranges::TimeRangesContainer;
+}
+
+pub mod text_input {
+    pub use embedder_traits::EditingDirection;
+
+    pub use crate::dom::html::form_controls::text_input::{
+        ClipboardProvider, Lines, SelectionDirection, TextInput,
+    };
+}
+
+pub mod encoding_detection {
+    pub use crate::dom::servoparser::encoding::{
+        get_xml_encoding, prescan_the_byte_stream_to_determine_the_encoding,
+    };
+}
+
+pub mod unminify {
+    pub use crate::dom::html::htmlscriptelement::substitute_with_local_script;
+    pub use crate::unminify::create_output_file;
 }

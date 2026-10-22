@@ -2,53 +2,65 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use net::cookie::Cookie;
+use std::time::{Duration, SystemTime};
+
+use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
 use servo_url::ServoUrl;
+use time::macros::datetime;
 
 #[test]
 fn test_domain_match() {
-    assert!(Cookie::domain_match("foo.com", "foo.com"));
-    assert!(Cookie::domain_match("bar.foo.com", "foo.com"));
-    assert!(Cookie::domain_match("baz.bar.foo.com", "foo.com"));
+    assert!(ServoCookie::domain_match("foo.com", "foo.com"));
+    assert!(ServoCookie::domain_match("bar.foo.com", "foo.com"));
+    assert!(ServoCookie::domain_match("baz.bar.foo.com", "foo.com"));
 
-    assert!(!Cookie::domain_match("bar.foo.com", "bar.com"));
-    assert!(!Cookie::domain_match("bar.com", "baz.bar.com"));
-    assert!(!Cookie::domain_match("foo.com", "bar.com"));
+    assert!(!ServoCookie::domain_match("bar.foo.com", "bar.com"));
+    assert!(!ServoCookie::domain_match("bar.com", "baz.bar.com"));
+    assert!(!ServoCookie::domain_match("foo.com", "bar.com"));
 
-    assert!(!Cookie::domain_match("bar.com", "bbar.com"));
-    assert!(Cookie::domain_match("235.132.2.3", "235.132.2.3"));
-    assert!(!Cookie::domain_match("235.132.2.3", "1.1.1.1"));
-    assert!(!Cookie::domain_match("235.132.2.3", ".2.3"));
+    assert!(!ServoCookie::domain_match("bar.com", "bbar.com"));
+
+    assert!(ServoCookie::domain_match("FOO.com", "foo.com"));
+    assert!(ServoCookie::domain_match("foo.com", "FOO.COM"));
+    assert!(ServoCookie::domain_match("BAR.foo.com", "foo.com"));
+    assert!(ServoCookie::domain_match("bar.FOO.com", "FOO.COM"));
+    assert!(!ServoCookie::domain_match("bar.foo.com", "BAR.COM"));
+    assert!(!ServoCookie::domain_match("foo.com", "BAR.COM"));
+    assert!(!ServoCookie::domain_match("bar.com", "BBAR.COM"));
+
+    assert!(ServoCookie::domain_match("235.132.2.3", "235.132.2.3"));
+    assert!(!ServoCookie::domain_match("235.132.2.3", "1.1.1.1"));
+    assert!(!ServoCookie::domain_match("235.132.2.3", ".2.3"));
 }
 
 #[test]
 fn test_path_match() {
-    assert!(Cookie::path_match("/", "/"));
-    assert!(Cookie::path_match("/index.html", "/"));
-    assert!(Cookie::path_match("/w/index.html", "/"));
-    assert!(Cookie::path_match("/w/index.html", "/w/index.html"));
-    assert!(Cookie::path_match("/w/index.html", "/w/"));
-    assert!(Cookie::path_match("/w/index.html", "/w"));
+    assert!(ServoCookie::path_match("/", "/"));
+    assert!(ServoCookie::path_match("/index.html", "/"));
+    assert!(ServoCookie::path_match("/w/index.html", "/"));
+    assert!(ServoCookie::path_match("/w/index.html", "/w/index.html"));
+    assert!(ServoCookie::path_match("/w/index.html", "/w/"));
+    assert!(ServoCookie::path_match("/w/index.html", "/w"));
 
-    assert!(!Cookie::path_match("/", "/w/"));
-    assert!(!Cookie::path_match("/a", "/w/"));
-    assert!(!Cookie::path_match("/", "/w"));
-    assert!(!Cookie::path_match("/w/index.html", "/w/index"));
-    assert!(!Cookie::path_match("/windex.html", "/w/"));
-    assert!(!Cookie::path_match("/windex.html", "/w"));
+    assert!(!ServoCookie::path_match("/", "/w/"));
+    assert!(!ServoCookie::path_match("/a", "/w/"));
+    assert!(!ServoCookie::path_match("/", "/w"));
+    assert!(!ServoCookie::path_match("/w/index.html", "/w/index"));
+    assert!(!ServoCookie::path_match("/windex.html", "/w/"));
+    assert!(!ServoCookie::path_match("/windex.html", "/w"));
 }
 
 #[test]
 fn test_default_path() {
-    assert_eq!(&*Cookie::default_path("/foo/bar/baz/"), "/foo/bar/baz");
-    assert_eq!(&*Cookie::default_path("/foo/bar/baz"), "/foo/bar");
-    assert_eq!(&*Cookie::default_path("/foo/"), "/foo");
-    assert_eq!(&*Cookie::default_path("/foo"), "/");
-    assert_eq!(&*Cookie::default_path("/"), "/");
-    assert_eq!(&*Cookie::default_path(""), "/");
-    assert_eq!(&*Cookie::default_path("foo"), "/");
+    assert_eq!(&*ServoCookie::default_path("/foo/bar/baz/"), "/foo/bar/baz");
+    assert_eq!(&*ServoCookie::default_path("/foo/bar/baz"), "/foo/bar");
+    assert_eq!(&*ServoCookie::default_path("/foo/"), "/foo");
+    assert_eq!(&*ServoCookie::default_path("/foo"), "/");
+    assert_eq!(&*ServoCookie::default_path("/"), "/");
+    assert_eq!(&*ServoCookie::default_path(""), "/");
+    assert_eq!(&*ServoCookie::default_path("foo"), "/");
 }
 
 #[test]
@@ -59,33 +71,37 @@ fn fn_cookie_constructor() {
 
     let gov_url = &ServoUrl::parse("http://gov.ac/foo").unwrap();
     // cookie name/value test
-    assert!(cookie_rs::Cookie::parse(" baz ").is_err());
-    assert!(cookie_rs::Cookie::parse(" = bar  ").is_err());
-    assert!(cookie_rs::Cookie::parse(" baz = ").is_ok());
+    assert!(cookie::Cookie::parse(" baz ").is_err());
+    assert!(cookie::Cookie::parse(" = bar  ").is_err());
+    assert!(cookie::Cookie::parse(" baz = ").is_ok());
 
     // cookie domains test
-    let cookie = cookie_rs::Cookie::parse(" baz = bar; Domain =  ").unwrap();
-    assert!(Cookie::new_wrapped(cookie.clone(), url, CookieSource::HTTP).is_some());
-    let cookie = Cookie::new_wrapped(cookie, url, CookieSource::HTTP).unwrap();
+    let cookie = cookie::Cookie::parse(" baz = bar; Domain =  ").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie.clone(), url, CookieSource::HTTP).is_some());
+    let cookie = ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).unwrap();
     assert_eq!(&**cookie.cookie.domain().as_ref().unwrap(), "example.com");
 
     // cookie public domains test
-    let cookie = cookie_rs::Cookie::parse(" baz = bar; Domain =  gov.ac").unwrap();
-    assert!(Cookie::new_wrapped(cookie.clone(), url, CookieSource::HTTP).is_none());
-    assert!(Cookie::new_wrapped(cookie, gov_url, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse(" baz = bar; Domain =  gov.ac").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie.clone(), url, CookieSource::HTTP).is_none());
+    assert!(ServoCookie::new_wrapped(cookie, gov_url, CookieSource::HTTP).is_some());
 
     // cookie domain matching test
-    let cookie = cookie_rs::Cookie::parse(" baz = bar ; Secure; Domain = bazample.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse(" baz = bar ; Secure; Domain = bazample.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
-    let cookie = cookie_rs::Cookie::parse(" baz = bar ; Secure; Path = /foo/bar/").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse(" baz = bar ; Secure; Path = /foo/bar/").unwrap();
+    assert!(
+        ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none(),
+        "Cookie with \"Secure\" attribute from non-secure source should be rejected"
+    );
 
-    let cookie = cookie_rs::Cookie::parse(" baz = bar ; HttpOnly").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::NonHTTP).is_none());
+    let cookie = cookie::Cookie::parse(" baz = bar ; HttpOnly").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::NonHTTP).is_none());
 
-    let cookie = cookie_rs::Cookie::parse(" baz = bar ; Secure; Path = /foo/bar/").unwrap();
-    let cookie = Cookie::new_wrapped(cookie, url, CookieSource::HTTP).unwrap();
+    let secure_url = &ServoUrl::parse("https://example.com/foo").unwrap();
+    let cookie = cookie::Cookie::parse(" baz = bar ; Secure; Path = /foo/bar/").unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, secure_url, CookieSource::HTTP).unwrap();
     assert_eq!(cookie.cookie.value(), "bar");
     assert_eq!(cookie.cookie.name(), "baz");
     assert!(cookie.cookie.secure().unwrap_or(false));
@@ -94,80 +110,85 @@ fn fn_cookie_constructor() {
     assert!(cookie.host_only);
 
     let u = &ServoUrl::parse("http://example.com/foobar").unwrap();
-    let cookie = cookie_rs::Cookie::parse("foobar=value;path=/").unwrap();
-    assert!(Cookie::new_wrapped(cookie, u, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse("foobar=value;path=/").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).is_some());
+
+    let cookie = cookie::Cookie::parse("foo=bar; max-age=99999999999999999999999999999").unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).unwrap();
+    assert!(
+        cookie
+            .expiry_time
+            .is_some_and(|exp| exp < SystemTime::now() + Duration::from_secs(401 * 24 * 60 * 60))
+    );
 }
 
 #[test]
 fn test_cookie_secure_prefix() {
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Secure-SID=12345").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("http://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Secure-SID=12345; Secure").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345; Secure").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Secure-SID=12345; Secure").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345; Secure").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Secure-SID=12345; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("http://example.com").unwrap();
-    let cookie =
-        cookie_rs::Cookie::parse("__Secure-SID=12345; Secure; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345; Secure; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie =
-        cookie_rs::Cookie::parse("__Secure-SID=12345; Secure; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse("__Secure-SID=12345; Secure; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
 }
 
 #[test]
 fn test_cookie_host_prefix() {
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("http://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Secure").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Secure").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Secure").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Secure").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Domain=example.com; Path=/").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Domain=example.com; Path=/").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("http://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
     let cookie =
-        cookie_rs::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com; Path=/").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
+        cookie::Cookie::parse("__Host-SID=12345; Secure; Domain=example.com; Path=/").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_none());
 
     let url = &ServoUrl::parse("https://example.com").unwrap();
-    let cookie = cookie_rs::Cookie::parse("__Host-SID=12345; Secure; Path=/").unwrap();
-    assert!(Cookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
+    let cookie = cookie::Cookie::parse("__Host-SID=12345; Secure; Path=/").unwrap();
+    assert!(ServoCookie::new_wrapped(cookie, url, CookieSource::HTTP).is_some());
 }
 
-#[cfg(target_os = "windows")]
 fn delay_to_ensure_different_timestamp() {
     use std::thread;
     use std::time::Duration;
@@ -177,20 +198,17 @@ fn delay_to_ensure_different_timestamp() {
     thread::sleep(Duration::from_millis(500));
 }
 
-#[cfg(not(target_os = "windows"))]
-fn delay_to_ensure_different_timestamp() {}
-
 #[test]
 fn test_sort_order() {
     use std::cmp::Ordering;
 
     let url = &ServoUrl::parse("http://example.com/foo").unwrap();
-    let a_wrapped = cookie_rs::Cookie::parse("baz=bar; Path=/foo/bar/").unwrap();
-    let a = Cookie::new_wrapped(a_wrapped.clone(), url, CookieSource::HTTP).unwrap();
+    let a_wrapped = cookie::Cookie::parse("baz=bar; Path=/foo/bar/").unwrap();
+    let a = ServoCookie::new_wrapped(a_wrapped.clone(), url, CookieSource::HTTP).unwrap();
     delay_to_ensure_different_timestamp();
-    let a_prime = Cookie::new_wrapped(a_wrapped, url, CookieSource::HTTP).unwrap();
-    let b = cookie_rs::Cookie::parse("baz=bar;Path=/foo/bar/baz/").unwrap();
-    let b = Cookie::new_wrapped(b, url, CookieSource::HTTP).unwrap();
+    let a_prime = ServoCookie::new_wrapped(a_wrapped, url, CookieSource::HTTP).unwrap();
+    let b = cookie::Cookie::parse("baz=bar;Path=/foo/bar/baz/").unwrap();
+    let b = ServoCookie::new_wrapped(b, url, CookieSource::HTTP).unwrap();
 
     assert!(b.cookie.path().as_ref().unwrap().len() > a.cookie.path().as_ref().unwrap().len());
     assert_eq!(CookieStorage::cookie_comparator(&a, &b), Ordering::Greater);
@@ -208,9 +226,39 @@ fn test_sort_order() {
 
 fn add_cookie_to_storage(storage: &mut CookieStorage, url: &ServoUrl, cookie_str: &str) {
     let source = CookieSource::HTTP;
-    let cookie = cookie_rs::Cookie::parse(cookie_str.to_owned()).unwrap();
-    let cookie = Cookie::new_wrapped(cookie, url, source).unwrap();
+    let cookie = cookie::Cookie::parse(cookie_str.to_owned()).unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, url, source).unwrap();
     storage.push(cookie, url, source);
+}
+
+fn assert_ip_cookie_bucket_collision_eviction(ip_a: &str, ip_b: &str) {
+    let mut storage = CookieStorage::new(5);
+    let ip_a = ServoUrl::parse(ip_a).unwrap();
+    let ip_b = ServoUrl::parse(ip_b).unwrap();
+    let source = CookieSource::HTTP;
+
+    for i in 1..=3 {
+        add_cookie_to_storage(&mut storage, &ip_a, &format!("a{i}=val{i}"));
+    }
+
+    for i in 1..=5 {
+        add_cookie_to_storage(&mut storage, &ip_b, &format!("b{i}=val{i}"));
+    }
+
+    let cookies_a = storage.cookies_for_url(&ip_a, source).unwrap();
+    assert_eq!(cookies_a.split("; ").count(), 3);
+    for i in 1..=3 {
+        assert!(cookies_a.contains(&format!("a{i}=val{i}")));
+    }
+}
+
+#[test]
+fn test_ip_cookie_bucket_collision_eviction() {
+    assert_ip_cookie_bucket_collision_eviction("http://192.168.0.1/path", "http://10.0.0.1/path");
+    assert_ip_cookie_bucket_collision_eviction(
+        "http://[2001:db8::1]/path",
+        "http://[2001:db8::2]/path",
+    );
 }
 
 #[test]
@@ -220,13 +268,13 @@ fn test_insecure_cookies_cannot_evict_secure_cookie() {
     let source = CookieSource::HTTP;
     let mut cookies = Vec::new();
 
-    cookies.push(cookie_rs::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
+    cookies.push(cookie::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
+    cookies.push(cookie::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
 
     for bare_cookie in cookies {
-        let cookie = Cookie::new_wrapped(bare_cookie, &secure_url, source).unwrap();
+        let cookie = ServoCookie::new_wrapped(bare_cookie, &secure_url, source).unwrap();
         storage.push(cookie, &secure_url, source);
     }
 
@@ -275,13 +323,13 @@ fn test_secure_cookies_eviction() {
     let source = CookieSource::HTTP;
     let mut cookies = Vec::new();
 
-    cookies.push(cookie_rs::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
+    cookies.push(cookie::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
+    cookies.push(cookie::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
 
     for bare_cookie in cookies {
-        let cookie = Cookie::new_wrapped(bare_cookie, &url, source).unwrap();
+        let cookie = ServoCookie::new_wrapped(bare_cookie, &url, source).unwrap();
         storage.push(cookie, &url, source);
     }
 
@@ -317,13 +365,13 @@ fn test_secure_cookies_eviction_non_http_source() {
     let source = CookieSource::NonHTTP;
     let mut cookies = Vec::new();
 
-    cookies.push(cookie_rs::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
-    cookies.push(cookie_rs::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
+    cookies.push(cookie::Cookie::parse("foo=bar; Secure; Domain=home.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo2=bar; Secure; Domain=.example.org").unwrap());
+    cookies.push(cookie::Cookie::parse("foo3=bar; Secure; Path=/foo").unwrap());
+    cookies.push(cookie::Cookie::parse("foo4=bar; Secure; Path=/foo/bar").unwrap());
 
     for bare_cookie in cookies {
-        let cookie = Cookie::new_wrapped(bare_cookie, &url, source).unwrap();
+        let cookie = ServoCookie::new_wrapped(bare_cookie, &url, source).unwrap();
         storage.push(cookie, &url, source);
     }
 
@@ -363,7 +411,7 @@ fn add_retrieve_cookies(
 
     // Add all cookies to the store
     for str_cookie in set_cookies {
-        let cookie = Cookie::from_cookie_string(str_cookie.to_owned(), &url, source).unwrap();
+        let cookie = ServoCookie::from_cookie_string(str_cookie, &url, source).unwrap();
         storage.push(cookie, &url, source);
     }
 
@@ -371,7 +419,7 @@ fn add_retrieve_cookies(
     let url = ServoUrl::parse(final_location).unwrap();
     storage
         .cookies_for_url(&url, source)
-        .unwrap_or("".to_string())
+        .unwrap_or(String::new())
 }
 
 #[test]
@@ -384,7 +432,7 @@ fn test_cookie_eviction_expired() {
         );
         vec.push(st);
     }
-    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2027 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2127 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -398,13 +446,13 @@ fn test_cookie_eviction_all_secure_one_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..5 {
         let st = format!(
-            "extra{}=bar; Secure; expires=Sun, 18-Apr-2026 21:06:29 GMT",
+            "extra{}=bar; Secure; expires=Sun, 18-Apr-2126 21:06:29 GMT",
             i
         );
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT".to_owned());
-    vec.push("foo2=bar; Secure; expires=Sun, 18-Apr-2028 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT".to_owned());
+    vec.push("foo2=bar; Secure; expires=Sun, 18-Apr-2128 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -421,12 +469,12 @@ fn test_cookie_eviction_all_secure_new_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..6 {
         let st = format!(
-            "extra{}=bar; Secure; expires=Sun, 18-Apr-2026 21:06:29 GMT",
+            "extra{}=bar; Secure; expires=Sun, 18-Apr-2126 21:06:29 GMT",
             i
         );
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -442,10 +490,10 @@ fn test_cookie_eviction_all_secure_new_nonsecure() {
 fn test_cookie_eviction_all_nonsecure_new_secure() {
     let mut vec = Vec::new();
     for i in 1..6 {
-        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT", i);
+        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT", i);
         vec.push(st);
     }
-    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -461,10 +509,10 @@ fn test_cookie_eviction_all_nonsecure_new_secure() {
 fn test_cookie_eviction_all_nonsecure_new_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..6 {
-        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT", i);
+        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT", i);
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -473,5 +521,102 @@ fn test_cookie_eviction_all_nonsecure_new_nonsecure() {
     assert_eq!(
         &r,
         "extra2=bar; extra3=bar; extra4=bar; extra5=bar; foo=bar"
+    );
+}
+
+#[test]
+fn test_parse_date() {
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10 GMT"), // without day of week
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26-Jun-2024 15:35:10 GMT"), // dashed
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10"), // no GMT
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 24 15:35:10 GMT"), // 2-digit year
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 jun 2024 15:35:10 gmt"), // Lowercase
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+}
+
+#[test]
+fn test_clear_storage_for_url_expires_matching_cookies() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("foo=bar")
+    );
+
+    storage.clear_storage(Some(&url));
+
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+}
+
+#[test]
+fn test_clear_storage_without_url_clears_everything() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+    let other_url = ServoUrl::parse("http://example.org/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &other_url, "baz=qux");
+
+    storage.clear_storage(None);
+
+    assert!(storage.cookie_site_descriptors().is_empty());
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(storage.cookies_for_url(&other_url, source), None);
+}
+
+#[test]
+fn test_delete_cookie_with_name_expires_only_matching_cookie() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &url, "baz=qux");
+
+    storage.delete_cookie_with_name(&url, "foo".to_owned());
+
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("baz=qux")
+    );
+}
+
+#[test]
+fn test_delete_cookie_with_name_does_not_affect_other_domains() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+    let other_url = ServoUrl::parse("http://example.org/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &other_url, "foo=bar");
+
+    storage.delete_cookie_with_name(&url, "foo".to_owned());
+
+    storage.remove_all_expired_cookies();
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(
+        storage.cookies_for_url(&other_url, source).as_deref(),
+        Some("foo=bar")
     );
 }

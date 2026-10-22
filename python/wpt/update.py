@@ -4,32 +4,33 @@
 # pylint: disable=missing-docstring
 
 import os
-import subprocess
+import re
 import shutil
+import subprocess
 import sys
+import tempfile
+from argparse import ArgumentParser, Namespace
+from typing import Any
 
-from wptrunner.update import setup_logging, WPTUpdate  # noqa: F401
-from wptrunner.update.base import exit_unclean  # noqa: F401
 from wptrunner import wptcommandline  # noqa: F401
+from wptrunner.update import WPTUpdate, setup_logging  # noqa: F401
+from wptrunner.update.base import exit_unclean  # noqa: F401
 
-from . import WPT_PATH, update_args_for_legacy_layout
-from . import manifestupdate
+from . import WPT_PATH, manifestupdate
 
-TEST_ROOT = os.path.join(WPT_PATH, 'tests')
-META_ROOTS = [
-    os.path.join(WPT_PATH, 'meta'),
-    os.path.join(WPT_PATH, 'meta-legacy')
-]
+TEST_ROOT = os.path.join(WPT_PATH, "tests")
+META_ROOTS = [os.path.join(WPT_PATH, "meta"), os.path.join(WPT_PATH, "meta-legacy")]
+GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/(\w+\/\w+)\/actions\/runs\/(\d+)$")
 
 
-def do_sync(**kwargs) -> int:
+def do_sync(**kwargs: str) -> int:
     last_commit = subprocess.check_output(["git", "log", "-1"])
 
     # Commits should always be authored by the GitHub Actions bot.
     os.environ["GIT_AUTHOR_NAME"] = "Servo WPT Sync"
     os.environ["GIT_AUTHOR_EMAIL"] = "ghbot+wpt-sync@servo.org"
-    os.environ["GIT_COMMITTER_NAME"] = os.environ['GIT_AUTHOR_NAME']
-    os.environ["GIT_COMMITTER_EMAIL"] = os.environ['GIT_AUTHOR_EMAIL']
+    os.environ["GIT_COMMITTER_NAME"] = os.environ["GIT_AUTHOR_NAME"]
+    os.environ["GIT_COMMITTER_EMAIL"] = os.environ["GIT_AUTHOR_EMAIL"]
 
     print("Updating WPT from upstream...")
     run_update(**kwargs)
@@ -52,7 +53,7 @@ def do_sync(**kwargs) -> int:
     return 0
 
 
-def remove_unused_metadata():
+def remove_unused_metadata() -> None:
     print("Removing unused results...")
     unused_files = []
     unused_dirs = []
@@ -60,16 +61,14 @@ def remove_unused_metadata():
     for meta_root in META_ROOTS:
         for base_dir, dir_names, files in os.walk(meta_root):
             # Skip recursing into any directories that were previously found to be missing.
-            if base_dir in unused_dirs:
-                # Skip processing any subdirectories of known missing directories.
-                unused_dirs += [os.path.join(base_dir, x) for x in dir_names]
+            if any([os.path.commonpath([base_dir, unused_dir]) == unused_dir for unused_dir in unused_dirs]):
                 continue
 
             for dir_name in dir_names:
                 dir_path = os.path.join(base_dir, dir_name)
 
                 # Skip any known directories that are meta-metadata.
-                if dir_name == '.cache':
+                if dir_name == ".cache":
                     unused_dirs.append(dir_path)
                     continue
 
@@ -80,12 +79,11 @@ def remove_unused_metadata():
 
             for fname in files:
                 # Skip any known files that are meta-metadata.
-                if not fname.endswith(".ini") or fname == '__dir__.ini':
+                if not fname.endswith(".ini") or fname == "__dir__.ini":
                     continue
 
                 # Turn tests/wpt/meta/foo/bar.html.ini into tests/wpt/tests/foo/bar.html.
-                test_file = os.path.join(
-                    TEST_ROOT, os.path.relpath(base_dir, meta_root), fname[:-4])
+                test_file = os.path.join(TEST_ROOT, os.path.relpath(base_dir, meta_root), fname[:-4])
 
                 if not os.path.exists(test_file):
                     unused_files.append(os.path.join(base_dir, fname))
@@ -98,8 +96,8 @@ def remove_unused_metadata():
         shutil.rmtree(directory)
 
 
-def update_tests(**kwargs) -> int:
-    def set_if_none(args: dict, key: str, value):
+def update_tests(**kwargs: Any) -> int:
+    def set_if_none(args: dict, key: str, value: str) -> None:
         if key not in args or args[key] is None:
             args[key] = value
 
@@ -108,27 +106,78 @@ def update_tests(**kwargs) -> int:
     kwargs["store_state"] = False
 
     wptcommandline.set_from_config(kwargs)
-    if hasattr(wptcommandline, 'check_paths'):
+    if hasattr(wptcommandline, "check_paths"):
         wptcommandline.check_paths(kwargs["test_paths"])
 
-    if kwargs.pop("legacy_layout"):
-        update_args_for_legacy_layout(kwargs)
-
-    if kwargs.get('sync', False):
+    if kwargs.get("sync", False):
         return do_sync(**kwargs)
 
     return 0 if run_update(**kwargs) else 1
 
 
-def run_update(**kwargs) -> bool:
+def run_update(**kwargs: Any) -> bool:
     """Run the update process returning True if the process is successful."""
+    if any([GITHUB_ACTION_RUN_URL_REGEX.search(argument) for argument in sys.argv]):
+        return download_run_results_and_then_run_update(kwargs)
+
     logger = setup_logging(kwargs, {"mach": sys.stdout})
     return WPTUpdate(logger, **kwargs).run() != exit_unclean
 
 
-def create_parser(**_kwargs):
+def download_run_results_and_then_run_update(kwargs: dict[str, Any]) -> bool:
+    """If any of the arguments passed to `./mach update-wpt` are URLs, attempt to
+    interpret them as GitHub Action Run URLs and download any test results, passing
+    the downloaded results as the input to the WPT metadata update."""
+    with tempfile.TemporaryDirectory() as directory:
+        downloaded_run_logs = []
+        for argument in sys.argv:
+            if argument.startswith("-") or argument == "update-wpt":
+                continue
+
+            match = GITHUB_ACTION_RUN_URL_REGEX.search(argument)
+            if not match:
+                downloaded_run_logs.append(argument)
+                continue
+
+            repository = match.group(1)
+            run_id = match.group(2)
+            run_path = os.path.join(directory, run_id)
+            os.makedirs(run_path)
+
+            print(f"Downloading unexpected stable results from run {run_id} of {repository}")
+            if (
+                subprocess.check_call(
+                    [
+                        "gh",
+                        "run",
+                        "download",
+                        run_id,
+                        "-R",
+                        repository,
+                        "--dir",
+                        run_path,
+                        "--pattern",
+                        "*stable-unexpected-results-linux*",
+                    ]
+                )
+                != 0
+            ):
+                print(f"Could not download artifact from run id {run_id}.")
+                print("Is `gh` installed and authenticated?")
+                return False
+            downloaded_run_logs.append(
+                os.path.join(run_path, "stable-unexpected-results-linux", "stable-unexpected-results.log")
+            )
+
+        kwargs["run_log"] = downloaded_run_logs
+        logger = setup_logging(kwargs, {"mach": sys.stdout})
+        return WPTUpdate(logger, **kwargs).run() != exit_unclean
+
+
+def create_parser() -> ArgumentParser:
+    return wptcommandline.create_parser_update()
+
+
+def parse_args_update(update_paths: list[str]) -> Namespace:
     parser = wptcommandline.create_parser_update()
-    parser.add_argument("--legacy-layout", "--layout-2013", "--with-layout-2013",
-                        default=False, action="store_true",
-                        help="Use expected results for the legacy layout engine")
-    return parser
+    return parser.parse_args(update_paths)

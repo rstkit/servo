@@ -2,49 +2,77 @@ name: MacOS
 
 on:
   workflow_call:
+    outputs:
+      artifact_ids:
+        value: ${{ jobs.build.outputs.artifact_ids }}
+        description: Comma-separated list of artifact IDs for the release artifacts
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: string
-      wpt-tests-to-run:
+      build-args:
         default: ""
         required: false
         type: string
-      wpt-layout:
+      wpt-args:
+        default: ""
         required: false
         type: string
+      wpt:
+        required: false
+        type: boolean
       unit-tests:
         required: false
         default: false
         type: boolean
-      upload:
+      build-libservo:
         required: false
         default: false
         type: boolean
-      github-release-id:
+      force-github-hosted-runner:
         required: false
-        type: string
+        type: boolean
+        default: false
+      bencher:
+        required: false
+        default: false
+        type: boolean
+      capi:
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: choice
-        options: ["release", "debug", "production"]
-      wpt-tests-to-run:
+        options: ["checked-release", "release", "debug", "production"]
+      wpt-args:
         default: ""
         required: false
         type: string
-      wpt-layout:
+      wpt:
         required: false
-        type: choice
-        options: ["none", "2013", "2020", "all"]
+        type: boolean
       unit-tests:
         required: false
         default: false
         type: boolean
-      upload:
+      build-libservo:
+        required: false
+        default: false
+        type: boolean
+      force-github-hosted-runner:
+        required: false
+        type: boolean
+        default: false
+      bencher:
+        required: false
+        default: false
+        type: boolean
+      capi:
         required: false
         default: false
         type: boolean
@@ -52,15 +80,40 @@ on:
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CCACHE: "sccache"
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Runs the underlying job (“workload”) on a self-hosted runner if available,
+  # with the help of a `runner-select` job and a `runner-timeout` job.
+  runner-select:
+    runs-on: ubuntu-24.04
+    outputs:
+      unique-id: ${{ steps.select.outputs.unique-id }}
+      selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
+      runner-type-label: ${{ steps.select.outputs.runner-type-label }}
+      is-self-hosted: ${{ steps.select.outputs.is-self-hosted }}
+    steps:
+      - name: Runner select
+        id: select
+        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          github-hosted-runner-label: macos-15-intel
+          self-hosted-image-name: servo-macos13
+          # You can disable self-hosted runners globally by creating a repository variable named
+          # NO_SELF_HOSTED_RUNNERS with any non-empty value.
+          # <https://github.com/servo/servo/settings/variables/actions>
+          NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
+          # Any other boolean conditions that disable self-hosted runners go here.
+          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+
   build:
-    name: MacOS Build
-    runs-on: macos-13
+    needs:
+      - runner-select
+    name: MacOS Build [${{ needs.runner-select.outputs.unique-id }}]
+    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
+    outputs:
+      artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
       # XProtect can cause random failures if it decides that the DMG we create
       # during the packaging phase is malware.
@@ -69,105 +122,151 @@ jobs:
       - name: Kill XProtectBehaviorService
         run: |
           echo Killing XProtect.; sudo pkill -9 XProtect >/dev/null || true;
-      - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+
+      - if: runner.environment != 'self-hosted'
+        name: Setup Python
+        uses: ./.github/actions/setup-python
+
+      # Always install crown, even on self-hosted runners, because it is tightly
+      # coupled to the rustc version, and we may have the wrong version if the
+      # commit we are building uses a different rustc version.
+      - name: Install crown
+        run: cargo install --path support/crown
+
+      - name: Install cargo nextest
+        if: ${{ inputs.unit-tests }}
+        uses: taiki-e/install-action@v2
         with:
-          ref: refs/pull/${{ github.event.number }}/head
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.4
-      - name: Install taplo
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: taplo-cli
-          locked: true
-      - name: Install cargo-deny
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: cargo-deny
-          locked: true
-      - name: Bootstrap
+          tool: nextest@0.9.140
+
+      - if: runner.environment != 'self-hosted'
+        name: Bootstrap
         run: |
-          python3 -m pip install --upgrade pip
-          python3 ./mach bootstrap
-          brew install gnu-tar
+          ./mach bootstrap --yes --skip-lints --skip-nextest
+          brew install gnu-tar shellcheck
       - name: Build (${{ inputs.profile }})
+        env:
+          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
         run: |
-          python3 ./mach build --use-crown --locked --${{ inputs.profile }}
-          cp -r target/cargo-timings target/cargo-timings-macos
+          ./mach build --use-crown --locked --profile ${{ inputs.profile }}  ${{ inputs.build-args }}
+          mv target/cargo-timings target/cargo-timings-macos
       - name: Smoketest
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with: # See https://github.com/servo/servo/issues/30757
           timeout_minutes: 5
           max_attempts: 2
-          command: python3 ./mach smoketest --${{ inputs.profile }}
+          command: ./mach smoketest --profile ${{ inputs.profile }}
       - name: Script tests
         run: ./mach test-scripts
       - name: Unit tests
         if: ${{ inputs.unit-tests }}
-        uses: nick-fields/retry@v3
+        id: run_unit_tests
+        env:
+          NEXTEST_RETRIES: 3 # https://github.com/servo/servo/issues/30683
+        run: ./mach test-unit --profile ${{ inputs.profile }} --nextest-profile ci
+      # We upload the test-results to Codecov to help us identify flaky unit-tests.
+      - name: Upload test results to Codecov
+        # Upload test results to Codecov, also for failed unit-tests, but only
+        # if unit-tests were supposed to run, and not if they were skipped (e.g., due
+        # to an earlier failure).
+        if: ${{ !cancelled() && steps.run_unit_tests.conclusion != 'skipped' }}
+        uses: codecov/codecov-action@v6
         with:
-          timeout_minutes: 20 # https://github.com/servo/servo/issues/30275
-          max_attempts: 3 # https://github.com/servo/servo/issues/30683
-          command: python3 ./mach test-unit --${{ inputs.profile }}
+          report_type: test_results
+          files: target/nextest/ci/junit.xml
+          disable_search: true
+          flags: unittests,unittests-mac,unittests-mac-${{ inputs.profile }}
+          token: ${{ secrets.CODECOV_TOKEN }}
       - name: Build mach package
-        run: python3 ./mach package --${{ inputs.profile }}
+        run: ./mach package --profile ${{ inputs.profile }}
       - name: Run DMG smoketest
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with: # See https://github.com/servo/servo/issues/30757
           timeout_minutes: 5
           max_attempts: 2
           command: ./etc/ci/macos_package_smoketest.sh target/${{ inputs.profile }}/servo-tech-demo.dmg
       - name: Archive build timing
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: cargo-timings-macos
+          name: cargo-timings-macos-${{ inputs.profile }}
           # Using a wildcard here ensures that the archive includes the path.
           path: target/cargo-timings-*
+          if-no-files-found: error
       - name: Upload artifact for mach package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
+        id: upload-dmg
         with:
-          name: mac
+          name: ${{ inputs.profile }}-binary-mac
           path: target/${{ inputs.profile }}/servo-tech-demo.dmg
-      - name: Upload nightly
-        if: ${{ inputs.upload }}
+          if-no-files-found: error
+      - name: Collect artifact IDs needed by the release workflow
+        id: artifact_ids
+        shell: bash
         run: |
-          python3 ./mach upload-nightly mac --secret-from-environment \
-            --github-release-id ${{ inputs.github-release-id }}
-        env:
-          S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}
-          GITHUB_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-          NIGHTLY_REPO_TOKEN: ${{ secrets.NIGHTLY_REPO_TOKEN }}
-          NIGHTLY_REPO: ${{ github.repository_owner }}/servo-nightly-builds
+          echo "artifact_ids=${{ steps.upload-dmg.outputs.artifact-id }}" >> $GITHUB_OUTPUT
       - name: Build package for target
-        run: gtar -czf target.tar.gz target/${{ inputs.profile }}/servo target/${{ inputs.profile }}/lib/*.dylib resources
+        run: gtar -czf target.tar.gz target/${{ inputs.profile }}/servoshell target/${{ inputs.profile }}/lib/*.dylib resources
       - name: Upload package for target
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.profile }}-binary-macos
           path: target.tar.gz
+          if-no-files-found: error
 
   wpt-2020:
-    if: ${{ inputs.wpt-layout == '2020' || inputs.wpt-layout == 'all' }}
+    if: ${{ inputs.wpt }}
     name: MacOS WPT
     needs: ["build"]
     uses: ./.github/workflows/mac-wpt.yml
     with:
       profile: ${{ inputs.profile }}
-      wpt-layout: "layout-2020"
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      wpt-args: ${{ inputs.wpt-args }}
+      arm: false
     secrets: inherit
 
-  wpt-2013:
-    if: ${{ inputs.wpt-layout == '2013' || inputs.wpt-layout == 'all' }}
-    name: MacOS WPT (Legacy)
+  bencher:
     needs: ["build"]
-    uses: ./.github/workflows/mac-wpt.yml
+    if: ${{ inputs.bencher && inputs.profile != 'debug' && github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
+    uses: ./.github/workflows/bencher.yml
     with:
+      target: "macos"
       profile: ${{ inputs.profile }}
-      wpt-layout: "layout-2013"
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      compressed-file-path: ${{ inputs.profile }}-binary-macos/target.tar.gz
+      binary-path: target/${{ inputs.profile }}/servoshell
+      file-size: true
+      speedometer: false
+      dromaeo: false
     secrets: inherit
+
+  build-libservo:
+    if: ${{ inputs.build-libservo }}
+    name: Build libservo and MSRV check
+    runs-on: macos-15-intel
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Setup Python
+        uses: ./.github/actions/setup-python
+      - name: Determine MSRV
+        id: msrv
+        uses: ./.github/actions/parse_msrv
+      - name: Install MSRV
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.rust_version }}
+      - name: Compile libservo with MSRV
+        run: |
+          cargo +${{ steps.msrv.outputs.rust_version }} build -p servo --locked
+
+  capi:
+    if: ${{ inputs.capi }}
+    name: Build and test Servo's C API
+    runs-on: macos-15-intel
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Install cargo-c # required by servo-capi-tests's build.rs
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-c@0.10.23
+      - name: Build and test servo-capi-tests
+        run: cargo test -p servo-capi-tests --locked

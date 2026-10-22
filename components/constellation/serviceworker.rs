@@ -2,37 +2,51 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
-
-use ipc_channel::Error;
-use script_traits::{SWManagerSenders, ServiceWorkerManagerFactory};
+#[cfg(feature = "multiprocess")]
+use ipc_channel::IpcError;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::GenericSender;
+#[cfg(feature = "multiprocess")]
 use servo_config::opts::{self, Opts};
-use servo_config::prefs::{self, PrefValue};
+#[cfg(feature = "multiprocess")]
+use servo_config::{prefs, prefs::Preferences};
+use servo_constellation_traits::{SWManagerSenders, ServiceWorkerManagerFactory};
 use servo_url::ImmutableOrigin;
 
-use crate::sandboxing::{spawn_multiprocess, UnprivilegedContent};
+#[cfg(feature = "multiprocess")]
+use crate::process_manager::Process;
+#[cfg(feature = "multiprocess")]
+use crate::sandboxing::UnprivilegedContent;
+#[cfg(feature = "multiprocess")]
+use crate::sandboxing::spawn_multiprocess;
 
 /// Conceptually, this is glue to start an agent-cluster for a service worker agent.
 /// <https://html.spec.whatwg.org/multipage/#obtain-a-service-worker-agent>
 #[derive(Deserialize, Serialize)]
 pub struct ServiceWorkerUnprivilegedContent {
-    opts: Opts,
-    prefs: HashMap<String, PrefValue>,
+    #[cfg(feature = "multiprocess")]
+    pub opts: Opts,
+    #[cfg(feature = "multiprocess")]
+    pub prefs: Box<Preferences>,
     senders: SWManagerSenders,
     origin: ImmutableOrigin,
+    lifeline_sender: Option<GenericSender<()>>,
 }
 
 impl ServiceWorkerUnprivilegedContent {
     pub fn new(
         senders: SWManagerSenders,
         origin: ImmutableOrigin,
+        lifeline_sender: Option<GenericSender<()>>,
     ) -> ServiceWorkerUnprivilegedContent {
         ServiceWorkerUnprivilegedContent {
+            #[cfg(feature = "multiprocess")]
             opts: (*opts::get()).clone(),
-            prefs: prefs::pref_map().iter().collect(),
+            #[cfg(feature = "multiprocess")]
+            prefs: Box::new(prefs::get().clone()),
             senders,
             origin,
+            lifeline_sender,
         }
     }
 
@@ -45,15 +59,8 @@ impl ServiceWorkerUnprivilegedContent {
     }
 
     /// Start the agent-cluster in it's own process.
-    pub fn spawn_multiprocess(self) -> Result<(), Error> {
+    #[cfg(feature = "multiprocess")]
+    pub fn spawn_multiprocess(self) -> Result<Process, IpcError> {
         spawn_multiprocess(UnprivilegedContent::ServiceWorker(self))
-    }
-
-    pub fn opts(&self) -> Opts {
-        self.opts.clone()
-    }
-
-    pub fn prefs(&self) -> HashMap<String, PrefValue> {
-        self.prefs.clone()
     }
 }

@@ -2,370 +2,522 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Traversals over the DOM and flow trees, running the layout computations.
+use std::sync::Arc;
 
-use log::debug;
-use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
-use servo_config::opts;
+use layout_api::{
+    DangerousStyleElement, DangerousStyleNode, LayoutDamage, LayoutElement, LayoutNode,
+};
+use script::layout_dom::ServoLayoutNode;
 use style::context::{SharedStyleContext, StyleContext};
-use style::data::ElementData;
 use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
-use style::servo::restyle_damage::ServoRestyleDamage;
-use style::traversal::{recalc_style_at, DomTraversal, PerLevelTraversalData};
+use style::traversal::{DomTraversal, recalc_style_at};
 
-use crate::construct::FlowConstructor;
+use crate::BoxTree;
 use crate::context::LayoutContext;
-use crate::display_list::DisplayListBuildState;
-use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
-use crate::wrapper::ThreadSafeLayoutNodeHelpers;
-use crate::LayoutData;
+use crate::dom::{DOMLayoutData, NodeExt};
+use crate::layout_root::LayoutRoot;
 
-pub struct RecalcStyleAndConstructFlows<'a> {
-    context: LayoutContext<'a>,
+pub struct RecalcStyle<'a> {
+    context: &'a LayoutContext<'a>,
 }
 
-impl<'a> RecalcStyleAndConstructFlows<'a> {
-    /// Creates a traversal context, taking ownership of the shared layout context.
-    pub fn new(context: LayoutContext<'a>) -> Self {
-        RecalcStyleAndConstructFlows { context }
+impl<'a> RecalcStyle<'a> {
+    pub(crate) fn new(context: &'a LayoutContext<'a>) -> Self {
+        RecalcStyle { context }
     }
 
-    pub fn context(&self) -> &LayoutContext<'a> {
-        &self.context
-    }
-
-    /// Consumes this traversal context, returning ownership of the shared layout
-    /// context to the caller.
-    pub fn destroy(self) -> LayoutContext<'a> {
+    pub(crate) fn context(&self) -> &LayoutContext<'a> {
         self.context
     }
 }
 
-#[allow(unsafe_code)]
-impl<'a, 'dom, E> DomTraversal<E> for RecalcStyleAndConstructFlows<'a>
+impl<'dom, E> DomTraversal<E> for RecalcStyle<'_>
 where
-    E: TElement,
-    E::ConcreteNode: LayoutNode<'dom>,
+    E: DangerousStyleElement<'dom> + TElement,
+    E::ConcreteNode: 'dom + DangerousStyleNode<'dom>,
 {
     fn process_preorder<F>(
         &self,
-        traversal_data: &PerLevelTraversalData,
         context: &mut StyleContext<E>,
         node: E::ConcreteNode,
         note_child: F,
     ) where
         F: FnMut(E::ConcreteNode),
     {
-        // FIXME(pcwalton): Stop allocating here. Ideally this should just be
-        // done by the HTML parser.
-        unsafe { node.initialize_style_and_layout_data::<LayoutData>() };
+        let Some(dangerous_style_element) = node.as_element() else {
+            return;
+        };
 
-        if !node.is_text_node() {
-            let el = node.as_element().unwrap();
-            let mut data = el.mutate_data().unwrap();
-            recalc_style_at(self, traversal_data, context, el, &mut data, note_child);
+        let layout_element = dangerous_style_element.layout_element();
+        let had_style_data = layout_element.style_data().is_some();
+        layout_element.initialize_style_and_layout_data::<DOMLayoutData>();
+
+        let mut element_data = dangerous_style_element.mutate_data().unwrap();
+        if !had_style_data {
+            element_data.damage = RestyleDamage::reconstruct();
         }
+
+        recalc_style_at(
+            self,
+            context,
+            dangerous_style_element,
+            &mut element_data,
+            note_child,
+        );
     }
 
-    fn process_postorder(&self, _style_context: &mut StyleContext<E>, node: E::ConcreteNode) {
-        construct_flows_at(&self.context, node);
+    #[inline]
+    fn needs_postorder_traversal() -> bool {
+        false
     }
 
-    fn text_node_needs_traversal(node: E::ConcreteNode, parent_data: &ElementData) -> bool {
-        // Text nodes never need styling. However, there are two cases they may need
-        // flow construction:
-        // (1) They child doesn't yet have layout data (preorder traversal initializes it).
-        // (2) The parent element has restyle damage (so the text flow also needs fixup).
-        node.layout_data().is_none() || !parent_data.damage.is_empty()
+    fn process_postorder(&self, _style_context: &mut StyleContext<E>, _node: E::ConcreteNode) {
+        panic!("this should never be called")
     }
 
-    fn shared_context(&self) -> &SharedStyleContext {
+    fn shared_context(&self) -> &SharedStyleContext<'_> {
         &self.context.style_context
     }
 }
 
-/// A top-down traversal.
-pub trait PreorderFlowTraversal {
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&self, flow: &mut dyn Flow);
+#[servo_tracing::instrument(skip_all)]
+pub(crate) fn compute_damage_and_rebuild_box_tree<'dom>(
+    box_tree: &mut Option<Arc<BoxTree>>,
+    layout_context: &LayoutContext,
+    dirty_root: ServoLayoutNode<'dom>,
+    root_node: ServoLayoutNode<'dom>,
+    damage_from_environment: LayoutDamage,
+    layout_roots: &mut Vec<LayoutRoot<'dom>>,
+) -> LayoutDamage {
+    // First process damage below the dirty root, returning the damage that
+    // should be propagated upward into the clean part of the tree.
+    let layout_damage = compute_damage_and_rebuild_box_tree_below_dirty_root(
+        layout_context,
+        dirty_root,
+        damage_from_environment,
+        layout_roots,
+    );
 
-    /// Returns true if this node should be processed and false if neither this node nor its
-    /// descendants should be processed.
-    fn should_process_subtree(&self, _flow: &mut dyn Flow) -> bool {
-        true
+    // If there was no box tree at all at this point, a full box tree / fragment
+    // tree layout is necessary and there is no point processing any other damage.
+    if box_tree.is_none() {
+        *box_tree = Some(Arc::new(BoxTree::construct(layout_context, root_node)));
+        return layout_damage;
     }
 
-    /// Returns true if this node must be processed in-order. If this returns false,
-    /// we skip the operation for this node, but continue processing the descendants.
-    /// This is called *after* parent nodes are visited.
-    fn should_process(&self, _flow: &mut dyn Flow) -> bool {
-        true
+    // Propagate the damage from the dirty part of the tree upward. In this part of
+    // the traversal no elements can add damage, but they might isolate damage being
+    // propagated upward between the dirty root and the root of the DOM.
+    let layout_damage = compute_damage_and_rebuild_box_tree_above_dirty_root(
+        layout_context,
+        dirty_root,
+        layout_damage,
+        layout_roots,
+    );
+
+    // We could not find a place in the middle of the tree to run box tree reconstruction,
+    // so just rebuild the whole tree.
+    if layout_damage.contains(LayoutDamage::DescendantHasBoxDamage) {
+        *box_tree = Some(Arc::new(BoxTree::construct(layout_context, root_node)));
     }
 
-    /// Traverses the tree in preorder.
-    fn traverse(&self, flow: &mut dyn Flow) {
-        if !self.should_process_subtree(flow) {
-            return;
-        }
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
-        }
+    layout_damage
+}
+
+#[expect(unsafe_code)]
+#[servo_tracing::instrument(skip_all)]
+pub(crate) fn compute_damage_and_rebuild_box_tree_above_dirty_root<'dom>(
+    layout_context: &LayoutContext,
+    dirty_root: ServoLayoutNode<'dom>,
+    layout_damage: LayoutDamage,
+    layout_roots: &mut Vec<LayoutRoot<'dom>>,
+) -> LayoutDamage {
+    // Cases where propagating damage up the tree is necessary:
+    //
+    // 1. Box tree layout of the dirty root is necessary, in which case we
+    //    search for a place to re-run box tree layout and also invalidate
+    //    all fragments and fragment caches to the root.
+    // 2. Fragment tree layout needs to run again, in which case fragments
+    //    and fragment caches need to be invalidated.
+    // 3. Overflow is dirty, in which case overflow needs to be cleared.
+    //
+    // In every other case, just return early.
+    let needs_fragment_tree_rebuild = layout_damage.contains(LayoutDamage::Relayout);
+    let needs_overflow_recalculation = layout_damage.contains(LayoutDamage::RecalculateOverflow);
+    if !needs_fragment_tree_rebuild && !needs_overflow_recalculation {
+        assert!(!layout_damage.contains(LayoutDamage::DescendantCollectedAsLayoutRoot));
+        return layout_damage;
     }
 
-    /// Traverse the Absolute flow tree in preorder.
-    ///
-    /// Traverse all your direct absolute descendants, who will then traverse
-    /// their direct absolute descendants.
-    ///
-    /// Return true if the traversal is to continue or false to stop.
-    fn traverse_absolute_flows(&self, flow: &mut dyn Flow) {
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-        for descendant_link in flow.mut_base().abs_descendants.iter() {
-            self.traverse_absolute_flows(descendant_link)
-        }
+    let mut damage_for_parent = layout_damage;
+    let mut maybe_parent_node = unsafe { dirty_root.dangerous_flat_tree_parent() };
+    while let Some(parent_node) = maybe_parent_node {
+        let damage_set = ElementDamageSet {
+            node: parent_node,
+            from_parent: LayoutDamage::empty(),
+            on_element: LayoutDamage::empty(),
+            from_children: damage_for_parent,
+            // Ancestors above the dirty root do not have damage, so will never subsume
+            // any existing layout roots, but they may isolate upward flowing fragment
+            // tree damage.
+            incoming_layout_root_count: layout_roots.len(),
+        };
+
+        damage_for_parent = damage_set.apply_damage(layout_context, layout_roots);
+        maybe_parent_node = unsafe { parent_node.dangerous_flat_tree_parent() };
+    }
+
+    damage_for_parent
+}
+
+pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
+    layout_context: &LayoutContext,
+    node: ServoLayoutNode<'dom>,
+    damage_from_parent: LayoutDamage,
+    layout_roots: &mut Vec<LayoutRoot<'dom>>,
+) -> LayoutDamage {
+    // Don't do any kind of damage propagation or box tree construction for non-Element
+    // nodes, such as text and comments.
+    let Some(element) = node.as_element() else {
+        return damage_from_parent;
+    };
+
+    let (element_damage, is_display_none) = {
+        let mut element_data = element.element_data_mut();
+        (
+            LayoutDamage::from(std::mem::take(&mut element_data.damage)),
+            element_data.styles.is_display_none(),
+        )
+    };
+
+    let has_dirty_descendants;
+    #[expect(unsafe_code)]
+    unsafe {
+        let dangerous_style_element = element.dangerous_style_element();
+        has_dirty_descendants = dangerous_style_element.has_dirty_descendants();
+        dangerous_style_element.unset_dirty_descendants();
+    };
+
+    if is_display_none {
+        node.unset_all_boxes();
+        return element_damage | damage_from_parent;
+    }
+
+    let mut damage_set = ElementDamageSet {
+        node,
+        from_parent: damage_from_parent,
+        on_element: element_damage,
+        from_children: LayoutDamage::empty(),
+        incoming_layout_root_count: layout_roots.len(),
+    };
+
+    // Depending on the incoming damage, it can be isolated, meaning that some damage
+    // doesn't get passed down to children.
+    let damage_for_children = damage_set.isolate_incoming_damage();
+
+    // Propagate damage to children and gather the resulting damage into `from_children`.
+    damage_set.propagate_damage_to_children(
+        layout_context,
+        has_dirty_descendants,
+        damage_for_children,
+        layout_roots,
+    );
+
+    // Apply the calculated damage to this element (perhaps triggering box tree layout),
+    // and propagate resulting damage to ancestors.
+    damage_set.apply_damage(layout_context, layout_roots)
+}
+
+enum BoxDamageAction<'a> {
+    RebuildAncestor,
+    TryRebuild,
+    InvalidateFragmentTreeBelowLayoutRoot,
+    CollectLayoutRoot(LayoutRoot<'a>),
+    InvalidateFragmentTreeAboveLayoutRoot,
+    InvalidateScrollableOverflow,
+    None,
+}
+
+impl BoxDamageAction<'_> {
+    fn rebuilds_box(&self) -> bool {
+        matches!(self, Self::RebuildAncestor | Self::TryRebuild)
     }
 }
 
-/// A bottom-up traversal, with a optional in-order pass.
-pub trait PostorderFlowTraversal {
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&self, flow: &mut dyn Flow);
-
-    /// Returns false if this node must be processed in-order. If this returns false, we skip the
-    /// operation for this node, but continue processing the ancestors. This is called *after*
-    /// child nodes are visited.
-    fn should_process(&self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Traverses the tree in postorder.
-    fn traverse(&self, flow: &mut dyn Flow) {
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
-        }
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-    }
+pub(crate) struct ElementDamageSet<'a> {
+    node: ServoLayoutNode<'a>,
+    pub from_parent: LayoutDamage,
+    pub on_element: LayoutDamage,
+    pub from_children: LayoutDamage,
+    pub incoming_layout_root_count: usize,
 }
 
-/// An in-order (sequential only) traversal.
-pub trait InorderFlowTraversal {
-    /// The operation to perform. Returns the level of the tree we're at.
-    fn process(&mut self, flow: &mut dyn Flow, level: u32);
+impl<'a> ElementDamageSet<'a> {
+    /// Given the damage on the element and damage from parents, determine which damage
+    /// should be passed to children, returning that value.
+    fn isolate_incoming_damage(&mut self) -> LayoutDamage {
+        // Children only receive layout mode damage from their parents, except when an ancestor
+        // needs to be completely rebuilt. In that case, descendants are rebuilt down to the
+        // first independent formatting context, which should isolate that tree from further
+        // box damage.
+        let mut damage_for_children = (self.on_element | self.from_parent).only_layout_modes();
+        let rebuild_children = self.on_element.contains(LayoutDamage::BoxDamage) ||
+            (self.from_parent.contains(LayoutDamage::BoxDamage) &&
+                !self.node.isolates_damage_for_damage_propagation());
 
-    /// Returns true if this node should be processed and false if neither this node nor its
-    /// descendants should be processed.
-    fn should_process_subtree(&mut self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Traverses the tree in-order.
-    fn traverse(&mut self, flow: &mut dyn Flow, level: u32) {
-        if !self.should_process_subtree(flow) {
-            return;
-        }
-        self.process(flow, level);
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid, level + 1);
-        }
-    }
-}
-
-/// A bottom-up, parallelizable traversal.
-pub trait PostorderNodeMutTraversal<'dom, ConcreteThreadSafeLayoutNode>
-where
-    ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<'dom>,
-{
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&mut self, node: &ConcreteThreadSafeLayoutNode);
-}
-
-#[allow(unsafe_code)]
-#[inline]
-pub unsafe fn construct_flows_at_ancestors<'dom>(
-    context: &LayoutContext,
-    mut node: impl LayoutNode<'dom>,
-) {
-    while let Some(element) = node.traversal_parent() {
-        element.set_dirty_descendants();
-        node = element.as_node();
-        construct_flows_at(context, node);
-    }
-}
-
-/// The flow construction traversal, which builds flows for styled nodes.
-#[inline]
-#[allow(unsafe_code)]
-fn construct_flows_at<'dom>(context: &LayoutContext, node: impl LayoutNode<'dom>) {
-    debug!("construct_flows_at: {:?}", node);
-
-    // Construct flows for this node.
-    {
-        let tnode = node.to_threadsafe();
-
-        // Always reconstruct if incremental layout is turned off.
-        let nonincremental_layout = opts::get().nonincremental_layout;
-        if nonincremental_layout ||
-            tnode.restyle_damage() != RestyleDamage::empty() ||
-            node.as_element()
-                .map_or(false, |el| el.has_dirty_descendants())
+        if rebuild_children {
+            damage_for_children.insert(LayoutDamage::BoxDamage);
+        } else if self.from_parent.contains(LayoutDamage::Relayout) &&
+            !self.on_element.contains(LayoutDamage::Relayout) &&
+            self.node.isolates_damage_for_damage_propagation()
         {
-            let mut flow_constructor = FlowConstructor::new(context);
-            if nonincremental_layout || !flow_constructor.repair_if_possible(&tnode) {
-                flow_constructor.process(&tnode);
-                debug!(
-                    "Constructed flow for {:?}: {:x}",
-                    tnode,
-                    tnode.flow_debug_id()
-                );
+            // If not rebuilding the boxes for this node, but fragments need to be laid out
+            // only because of an ancestor, fragment layout caches should still be valid when
+            // crossing down into new independent formatting contexts.
+            damage_for_children.remove(LayoutDamage::Relayout);
+            self.from_parent.remove(LayoutDamage::Relayout);
+        }
+
+        damage_for_children
+    }
+
+    /// Given the damage the damage to children and whether or not this element had any
+    /// dirty descendants, conditionally propagated damage to children and set the resulting
+    /// damage from children on this [`ElementDamageSet`].
+    fn propagate_damage_to_children(
+        &mut self,
+        layout_context: &LayoutContext<'_>,
+        has_dirty_descendants: bool,
+        damage_for_children: LayoutDamage,
+        layout_roots: &mut Vec<LayoutRoot<'a>>,
+    ) {
+        // Propagate damage into children, but only if:
+        //  1. There is a descendant that was dirty / possibly restyled.
+        //  2. We detected that we need to rebuild child boxes.
+        //  3. An ancestor will be laid out and children need to have their fragment caches cleared.
+        //
+        // In other situations, such as when layout will not run at all or when we are
+        // guaranteed that children are undamaged, we can skip traversing children entirely.
+        if has_dirty_descendants ||
+            damage_for_children.intersects(LayoutDamage::BoxDamage | LayoutDamage::Relayout)
+        {
+            for child in self.node.flat_tree_children() {
+                if child.is_element() {
+                    self.from_children |= compute_damage_and_rebuild_box_tree_below_dirty_root(
+                        layout_context,
+                        child,
+                        damage_for_children,
+                        layout_roots,
+                    );
+                }
             }
         }
-
-        tnode
-            .mutate_layout_data()
-            .unwrap()
-            .flags
-            .insert(crate::data::LayoutDataFlags::HAS_BEEN_TRAVERSED);
     }
 
-    if let Some(el) = node.as_element() {
-        unsafe {
-            el.unset_dirty_descendants();
+    /// Given the damage from this element, the parent, and children, determine what action to
+    /// take for this element's boxes and return the damage that should be propagated to parents.
+    fn apply_damage(
+        self,
+        layout_context: &LayoutContext<'_>,
+        layout_roots: &mut Vec<LayoutRoot<'a>>,
+    ) -> LayoutDamage {
+        let only_layout_mode_damage =
+            (self.from_parent | self.on_element | self.from_children).only_layout_modes();
+
+        let invalidate_for_rebuild = || {
+            self.node.unset_all_boxes();
+            LayoutDamage::DescendantHasBoxDamage | LayoutDamage::Relayout
+        };
+
+        // This removes any dirty layout roots from descendants.
+        let discard_any_descendant_layout_roots = |layout_roots: &mut Vec<LayoutRoot>| {
+            layout_roots.truncate(self.incoming_layout_root_count);
+        };
+
+        let action = self.box_damage_action();
+        let will_rebuild_box = action.rebuilds_box();
+        let damage_for_parent = match action {
+            BoxDamageAction::TryRebuild => {
+                discard_any_descendant_layout_roots(layout_roots);
+
+                if self
+                    .node
+                    .rebuild_box_tree_from_independent_formatting_context(layout_context)
+                {
+                    // In this case, we have rebuilt the box tree from this point and we do not
+                    // have to propagate rebuild box tree damage up the tree any further.
+                    LayoutDamage::Relayout | LayoutDamage::RecomputeInlineContentSizes
+                } else {
+                    // A descendant needs to be rebuilt, but couldn't be rebuilt here,
+                    // because this node was an not a rebuild-compatible independent
+                    // formatting context. In this case do the same thing as if we needed
+                    // to rebuild an ancestor.
+                    invalidate_for_rebuild()
+                }
+            },
+            BoxDamageAction::RebuildAncestor => {
+                // In this case an ancestor needs to be completely rebuilt.
+                //
+                // This means that this box is no longer valid and also needs to be rebuilt
+                // (perhaps some of its descendants do not though). In this case, unset all existing
+                // boxes for the node and ensure that the appropriate rebuild-type damage
+                // propagates up the tree.
+                discard_any_descendant_layout_roots(layout_roots);
+                invalidate_for_rebuild()
+            },
+            BoxDamageAction::InvalidateFragmentTreeBelowLayoutRoot => {
+                // In this case, this node's boxes are preserved! It's possible that we still need
+                // to run fragment tree layout in this subtree due to an ancestor, this node, or a
+                // descendant changing style. In that case, we ask the `LayoutBoxBase` to clear
+                // any cached information that cannot be used.
+                discard_any_descendant_layout_roots(layout_roots);
+
+                let mut damage_for_parent =
+                    (self.on_element | self.from_children) | self.from_parent.only_layout_modes();
+
+                // This node also needed new fragment tree layout, so if any descendant
+                // was collected as a layout root, it's now discarded. This means we
+                // should also clear the damage (though harmless as Relayout takes
+                // precedence) indicating that there was a collected layout root.
+                damage_for_parent.remove(LayoutDamage::DescendantCollectedAsLayoutRoot);
+
+                let mut inline_size_depends_on_content = false;
+                self.node.with_layout_box_base_including_pseudos(|base| {
+                    inline_size_depends_on_content |=
+                        base.invalidate_caches_for_fragment_tree_layout(&self);
+                });
+
+                self.adjust_inline_content_size_damage(
+                    &mut damage_for_parent,
+                    inline_size_depends_on_content,
+                );
+
+                damage_for_parent
+            },
+            BoxDamageAction::CollectLayoutRoot(layout_root) => {
+                // A layout root should only be collected if a parent node does not
+                // produce damage requiring a fragment tree layout. This is essential
+                // to ensure the invariant that layout roots are only collected when
+                // they isolate damage from ancestors. If an ancestor has damage, a
+                // layout root's final position depends on that ancestor's layout
+                // and should never be a collected layout root.
+                debug_assert!(!self.from_parent.contains(LayoutDamage::Relayout));
+
+                // This removes any dirty layout roots from descendants and then adds this
+                // node as a dirty layout root. As this node itself as a dirty layout
+                // root, it subsumes all dirty descendant layout roots.
+                discard_any_descendant_layout_roots(layout_roots);
+                layout_roots.push(layout_root);
+
+                self.node.with_layout_box_base_including_pseudos(|base| {
+                    base.invalidate_caches(&self);
+                    base.mark_fragments_as_descendants_changed();
+                });
+                LayoutDamage::RecalculateOverflow |
+                    LayoutDamage::DescendantCollectedAsLayoutRoot |
+                    LayoutDamage::RecomputeInlineContentSizes
+            },
+            BoxDamageAction::InvalidateFragmentTreeAboveLayoutRoot => {
+                // Damage propagation works exactly the same at the point the layout root is collected
+                // and above it. Layout caches are invalidated and damage is adjusted, maybe limited
+                // inline content size recalculation.
+                let mut damage_for_parent = LayoutDamage::RecalculateOverflow |
+                    LayoutDamage::DescendantCollectedAsLayoutRoot;
+
+                let mut inline_size_depends_on_content = false;
+                self.node.with_layout_box_base_including_pseudos(|base| {
+                    inline_size_depends_on_content |= base.invalidate_caches(&self);
+                    base.mark_fragments_as_descendants_changed();
+                });
+                self.adjust_inline_content_size_damage(
+                    &mut damage_for_parent,
+                    inline_size_depends_on_content,
+                );
+
+                damage_for_parent
+            },
+            BoxDamageAction::InvalidateScrollableOverflow => {
+                // In this case the node's fragments are preserved, but it or one of its descendants
+                // had scrollable overflow damage, which means that scrollable overflow should be
+                // cleared. This causes it to be recalculated the next time it's queried.
+                self.node.with_layout_box_base_including_pseudos(|base| {
+                    base.clear_scrollable_overflow_all_on_fragments();
+                });
+                only_layout_mode_damage
+            },
+            BoxDamageAction::None => only_layout_mode_damage,
+        };
+
+        // If this element's boxes are preserved and its style has changed, whether or not
+        // we run fragment tree layout, we need to update any preserved layout data
+        // structures' style references.
+        if !self.on_element.is_empty() && !will_rebuild_box {
+            self.node.repair_style(&layout_context.style_context);
         }
-    }
-}
 
-/// The bubble-inline-sizes traversal, the first part of layout computation. This computes
-/// preferred and intrinsic inline-sizes and bubbles them up the tree.
-pub struct BubbleISizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PostorderFlowTraversal for BubbleISizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.bubble_inline_sizes();
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::BUBBLE_ISIZES);
+        damage_for_parent
     }
 
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .contains(ServoRestyleDamage::BUBBLE_ISIZES)
-    }
-}
-
-/// The assign-inline-sizes traversal. In Gecko this corresponds to `Reflow`.
-#[derive(Clone, Copy)]
-pub struct AssignISizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PreorderFlowTraversal for AssignISizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.assign_inline_sizes(self.layout_context);
-    }
-
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .intersects(ServoRestyleDamage::REFLOW_OUT_OF_FLOW | ServoRestyleDamage::REFLOW)
-    }
-}
-
-/// The assign-block-sizes-and-store-overflow traversal, the last (and most expensive) part of
-/// layout computation. Determines the final block-sizes for all layout objects and computes
-/// positions. In Gecko this corresponds to `Reflow`.
-#[derive(Clone, Copy)]
-pub struct AssignBSizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PostorderFlowTraversal for AssignBSizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        // Can't do anything with anything that floats might flow through until we reach their
-        // inorder parent.
-        //
-        // NB: We must return without resetting the restyle bits for these, as we haven't actually
-        // reflowed anything!
-        if flow.floats_might_flow_through() {
-            return;
+    fn box_damage_action(&self) -> BoxDamageAction<'a> {
+        // When a parent box is going to be reconstructed, that overrides everything else.
+        if self
+            .from_parent
+            .contains(LayoutDamage::DescendantHasBoxDamage)
+        {
+            return BoxDamageAction::RebuildAncestor;
         }
 
-        flow.assign_block_size(self.layout_context);
-    }
-
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        let base = flow.base();
-        base.restyle_damage.intersects(ServoRestyleDamage::REFLOW_OUT_OF_FLOW | ServoRestyleDamage::REFLOW) &&
-        // The fragmentation container is responsible for calling
-        // Flow::fragment recursively.
-        !base.flags.contains(FlowFlags::CAN_BE_FRAGMENTED)
-    }
-}
-
-pub struct ComputeStackingRelativePositions<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PreorderFlowTraversal for ComputeStackingRelativePositions<'a> {
-    #[inline]
-    fn should_process_subtree(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .contains(ServoRestyleDamage::REPOSITION)
-    }
-
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.compute_stacking_relative_position(self.layout_context);
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::REPOSITION)
-    }
-}
-
-pub struct BuildDisplayList<'a> {
-    pub state: DisplayListBuildState<'a>,
-}
-
-impl<'a> BuildDisplayList<'a> {
-    #[inline]
-    pub fn traverse(&mut self, flow: &mut dyn Flow) {
-        if flow.has_non_invertible_transform_or_zero_scale() {
-            return;
+        // When this element or one of its descendants needs to be reconstructed, try to
+        // rebuild it here. If that fails, an ancestor box will be reconstructed instead.
+        let element_and_children_damage = self.on_element | self.from_children;
+        if element_and_children_damage.contains(LayoutDamage::DescendantHasBoxDamage) {
+            return BoxDamageAction::TryRebuild;
         }
 
-        let parent_stacking_context_id = self.state.current_stacking_context_id;
-        self.state.current_stacking_context_id = flow.base().stacking_context_id;
-
-        let parent_clipping_and_scrolling = self.state.current_clipping_and_scrolling;
-        self.state.current_clipping_and_scrolling = flow.clipping_and_scrolling();
-
-        flow.build_display_list(&mut self.state);
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::REPAINT);
-
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
+        if element_and_children_damage.contains(LayoutDamage::Relayout) &&
+            !self.from_parent.contains(LayoutDamage::Relayout) &&
+            let Ok(layout_root) = LayoutRoot::try_from(self.node)
+        {
+            return BoxDamageAction::CollectLayoutRoot(layout_root);
         }
 
-        self.state.current_stacking_context_id = parent_stacking_context_id;
-        self.state.current_clipping_and_scrolling = parent_clipping_and_scrolling;
+        // If this element needs a new fragment layout, then invalidate fragment caches
+        // clear the resulting fragments, and clear scrollable overflow.
+        if (self.from_parent | element_and_children_damage).contains(LayoutDamage::Relayout) {
+            return BoxDamageAction::InvalidateFragmentTreeBelowLayoutRoot;
+        }
+
+        // If one of this element's descendants was collected as a layout root, then
+        // invalidate fragment caches and clear scrollable overflow.
+        if self
+            .from_children
+            .contains(LayoutDamage::DescendantCollectedAsLayoutRoot)
+        {
+            return BoxDamageAction::InvalidateFragmentTreeAboveLayoutRoot;
+        }
+
+        // If the scrollable overflow of this element has changed, invalidate the
+        // scrollable overflow.
+        if element_and_children_damage.contains(LayoutDamage::RecalculateOverflow) {
+            return BoxDamageAction::InvalidateScrollableOverflow;
+        }
+
+        BoxDamageAction::None
+    }
+
+    fn adjust_inline_content_size_damage(
+        &self,
+        damage_for_parent: &mut LayoutDamage,
+        inline_size_depends_on_content: bool,
+    ) {
+        let children_need_inline_content_size_recalculation = self
+            .from_children
+            .contains(LayoutDamage::RecomputeInlineContentSizes) &&
+            inline_size_depends_on_content;
+        damage_for_parent.set(
+            LayoutDamage::RecomputeInlineContentSizes,
+            !self.on_element.is_empty() || children_need_inline_content_size_recalculation,
+        );
     }
 }

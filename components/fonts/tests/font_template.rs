@@ -9,12 +9,11 @@ fn test_font_template_descriptor() {
     use std::fs::File;
     use std::io::prelude::*;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     use fonts::platform::font::PlatformFont;
-    use fonts::{FontIdentifier, FontTemplateDescriptor, PlatformFontMethods};
+    use fonts::{FontData, FontIdentifier, FontTemplateDescriptor, PlatformFontMethods};
     use servo_url::ServoUrl;
-    use style::values::computed::font::{FontStretch, FontStyle, FontWeight};
+    use style::values::computed::font::{FontStyle, FontWeight, FontWidth};
 
     fn descriptor(filename: &str) -> FontTemplateDescriptor {
         let mut path: PathBuf = [
@@ -29,40 +28,38 @@ fn test_font_template_descriptor() {
         path.push(format!("{}.ttf", filename));
 
         let identifier = FontIdentifier::Web(ServoUrl::from_file_path(path.clone()).unwrap());
-        let file = File::open(path.clone()).unwrap();
-        let data = file.bytes().map(|b| b.unwrap()).collect();
-        let handle = PlatformFont::new_from_data(identifier, Arc::new(data), 0, None).unwrap();
+
+        let mut bytes = Vec::new();
+        File::open(path.clone())
+            .expect("Couldn't open font file!")
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let data = FontData::from_bytes(&bytes);
+
+        let handle = PlatformFont::new_from_data(identifier, &data, None, false).unwrap();
         handle.descriptor()
     }
 
     assert_eq!(
         descriptor("DejaVuSans"),
-        FontTemplateDescriptor::new(
-            FontWeight::NORMAL,
-            FontStretch::hundred(),
-            FontStyle::NORMAL,
-        )
+        FontTemplateDescriptor::new(FontWeight::NORMAL, FontWidth::hundred(), FontStyle::NORMAL)
     );
 
     assert_eq!(
         descriptor("DejaVuSans-Bold"),
-        FontTemplateDescriptor::new(FontWeight::BOLD, FontStretch::hundred(), FontStyle::NORMAL,)
+        FontTemplateDescriptor::new(FontWeight::BOLD, FontWidth::hundred(), FontStyle::NORMAL)
     );
 
     assert_eq!(
         descriptor("DejaVuSans-Oblique"),
-        FontTemplateDescriptor::new(
-            FontWeight::NORMAL,
-            FontStretch::hundred(),
-            FontStyle::ITALIC,
-        )
+        FontTemplateDescriptor::new(FontWeight::NORMAL, FontWidth::hundred(), FontStyle::ITALIC)
     );
 
     assert_eq!(
         descriptor("DejaVuSansCondensed-BoldOblique"),
         FontTemplateDescriptor::new(
             FontWeight::BOLD,
-            FontStretch::from_percentage(0.875),
+            FontWidth::from_percentage(0.875),
             FontStyle::ITALIC,
         )
     );

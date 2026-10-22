@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub fn install() {}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -11,11 +11,11 @@ pub fn install() {
     use std::sync::atomic;
     use std::thread;
 
-    use sig::ffi::Sig;
+    use libc::siginfo_t;
 
     use crate::backtrace;
 
-    extern "C" fn handler(sig: i32) {
+    fn handler(siginfo: &siginfo_t) {
         // Only print crash message and backtrace the first time, to avoid
         // infinite recursion if the printing causes another signal.
         static BEEN_HERE_BEFORE: atomic::AtomicBool = atomic::AtomicBool::new(false);
@@ -26,7 +26,7 @@ pub fn install() {
             // practice will often segfault (see below).
             let stderr = std::io::stderr();
             let mut stderr = stderr.lock();
-            let _ = write!(&mut stderr, "Caught signal {sig}");
+            let _ = write!(&mut stderr, "Caught signal {}", siginfo.si_signo);
             if let Some(name) = thread::current().name() {
                 let _ = write!(&mut stderr, " in thread \"{}\"", name);
             }
@@ -42,21 +42,37 @@ pub fn install() {
         // know to be “async-signal-safe”, which includes sigaction(), raise(),
         // and _exit(), but generally doesn’t include anything that allocates.
         // https://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_04_03_03
-        unsafe {
-            // Reset the signal to the default action, and reraise the signal.
-            // Unlike libc::_exit(sig), which terminates the process normally,
-            // this terminates abnormally just like an uncaught signal, allowing
-            // mach (or your shell) to distinguish it from an ordinary exit, and
-            // allows your kernel to make a core dump if configured to do so.
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = libc::SIG_DFL;
-            libc::sigaction(sig, &action, std::ptr::null_mut());
-            libc::raise(sig);
-        }
+        raise_signal_or_exit_with_error(siginfo.si_signo);
     }
 
-    signal!(Sig::SEGV, handler); // handle segfaults
-    signal!(Sig::ILL, handler); // handle stack overflow and unsupported CPUs
-    signal!(Sig::IOT, handler); // handle double panics
-    signal!(Sig::BUS, handler); // handle invalid memory access
+    unsafe {
+        signal_hook_registry::register_unchecked(libc::SIGSEGV, handler)
+            .expect("Could not register SIGSEGV handler");
+        signal_hook_registry::register_unchecked(libc::SIGILL, handler)
+            .expect("Could not register SIGILL handler");
+        signal_hook_registry::register_unchecked(libc::SIGIOT, handler)
+            .expect("Could not register SIGIOT handler");
+        signal_hook_registry::register_unchecked(libc::SIGBUS, handler)
+            .expect("Could not register SIGBUS handler");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+pub(crate) fn raise_signal_or_exit_with_error(_signal: i32) {
+    std::process::exit(1);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn raise_signal_or_exit_with_error(signal: i32) {
+    unsafe {
+        // Reset the signal to the default action, and reraise the signal.
+        // Unlike libc::_exit(sig), which terminates the process normally,
+        // this terminates abnormally just like an uncaught signal, allowing
+        // mach (or your shell) to distinguish it from an ordinary exit, and
+        // allows your kernel to make a core dump if configured to do so.
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(signal, &action, std::ptr::null_mut());
+        libc::raise(signal);
+    }
 }

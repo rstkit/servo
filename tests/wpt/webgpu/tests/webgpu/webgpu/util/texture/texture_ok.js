@@ -1,6 +1,11 @@
 /**
 * AUTO-GENERATED - DO NOT EDIT. Source: https://github.com/gpuweb/cts
-**/import { assert, ErrorWithExtra, unreachable } from '../../../common/util/util.js';import { kTextureFormatInfo } from '../../format_info.js';
+**/import { assert, ErrorWithExtra, unreachable } from '../../../common/util/util.js';import {
+  getTextureFormatType,
+  isColorTextureFormat,
+  isDepthTextureFormat } from
+'../../format_info.js';
+
 import { numbersApproximatelyEqual } from '../conversion.js';
 import { generatePrettyTable, numericToStringBuilder } from '../pretty_diff_tables.js';
 import { reifyExtent3D, reifyOrigin3D } from '../unions.js';
@@ -175,13 +180,12 @@ copySize,
     aspect: source.aspect
   });
 
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     size: byteLength
   });
-  t.trackForCleanup(buffer);
 
-  const cmd = t.device.createCommandEncoder();
+  const cmd = t.device.createCommandEncoder({ label: 'createTextureCopyForMapRead' });
   cmd.copyTextureToBuffer(source, { buffer, bytesPerRow, rowsPerImage }, copySize);
   t.device.queue.submit([cmd.finish()]);
 
@@ -221,11 +225,14 @@ coords)
     return undefined;
   }
 
-  const info = kTextureFormatInfo[format];
   const repr = kTexelRepresentationInfo[format];
-  const numericToString = numericToStringBuilder(
-    info.sampleType === 'uint' || info.sampleType === 'sint'
-  );
+  // MAINTENANCE_TODO: Print depth-stencil formats as float+int instead of float+float.
+  const printAsInteger = isColorTextureFormat(format) ?
+  // For color, pick the type based on the format type
+  ['uint', 'sint'].includes(getTextureFormatType(format)) :
+  // Print depth as "float", depth-stencil as "float,float", stencil as "int".
+  !isDepthTextureFormat(format);
+  const numericToString = numericToStringBuilder(printAsInteger);
 
   const componentOrderStr = repr.componentOrder.join(',') + ':';
 

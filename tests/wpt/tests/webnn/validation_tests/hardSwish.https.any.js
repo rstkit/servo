@@ -1,10 +1,17 @@
 // META: title=validation tests for WebNN API hardSwish operation
-// META: global=window,dedicatedworker
+// META: global=window
+// META: variant=?cpu
+// META: variant=?gpu
+// META: variant=?npu
 // META: script=../resources/utils_validation.js
 
 'use strict';
 
 validateInputFromAnotherBuilder('hardSwish');
 
-validateUnaryOperation(
-    'hardSwish', floatingPointTypes, /*alsoBuildActivation=*/ true);
+const label = 'hard_swish';
+validateSingleInputOperation('hardSwish', label);
+
+validateOperandRank('hardSwish', 'input', (builder, input) => {
+  return builder.hardSwish(input);
+});

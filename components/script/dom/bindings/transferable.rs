@@ -5,18 +5,45 @@
 //! Trait representing the concept of [transferable objects]
 //! (<https://html.spec.whatwg.org/multipage/#transferable-objects>).
 
-use js::jsapi::MutableHandleObject;
+use std::hash::Hash;
 
-use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::structuredclone::StructuredDataHolder;
+use rustc_hash::FxHashMap;
+use script_bindings::reflector::DomObject;
+use script_bindings::structuredclone::{MarkedAsTransferableInIdl, StructuredData};
+use servo_base::id::NamespaceIndex;
+
+use crate::dom::bindings::error::Fallible;
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
 
-pub trait Transferable: DomObject {
-    fn transfer(&self, sc_holder: &mut StructuredDataHolder) -> Result<u64, ()>;
+pub(crate) trait Transferable: DomObject + MarkedAsTransferableInIdl
+where
+    Self: Sized,
+{
+    type Index: Copy + Eq + Hash;
+    type Data;
+
+    fn can_transfer(&self) -> bool {
+        true
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#transfer-steps>
+    fn transfer(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> Fallible<(NamespaceIndex<Self::Index>, Self::Data)>;
+
+    /// <https://html.spec.whatwg.org/multipage/#transfer-receiving-steps>
     fn transfer_receive(
+        cx: &mut js::context::JSContext,
         owner: &GlobalScope,
-        sc_holder: &mut StructuredDataHolder,
-        extra_data: u64,
-        return_object: MutableHandleObject,
-    ) -> Result<(), ()>;
+        id: NamespaceIndex<Self::Index>,
+        serialized: Self::Data,
+    ) -> Result<DomRoot<Self>, ()>;
+
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<FxHashMap<NamespaceIndex<Self::Index>, Self::Data>>;
 }
+
+pub(crate) fn assert_transferable<T: Transferable>() {}

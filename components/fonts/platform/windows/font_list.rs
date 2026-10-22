@@ -2,89 +2,51 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::hash::Hash;
 use std::sync::Arc;
 
-use base::text::{unicode_plane, UnicodeBlock, UnicodeBlockMethod};
-use dwrote::{Font, FontCollection, FontDescriptor, FontStretch, FontStyle};
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
+use dwrote::{Font, FontCollection, FontStretch, FontStyle};
+use fonts_traits::LocalFontIdentifier;
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod, unicode_plane};
+use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{FontStyle as StyleFontStyle, FontWeight as StyleFontWeight};
-use style::values::specified::font::FontStretchKeyword;
+use style::values::specified::font::FontWidthKeyword;
 
 use crate::{
-    EmojiPresentationPreference, FallbackFontSelectionOptions, FontTemplate, FontTemplateDescriptor,
+    EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier, FontTemplate,
+    FontTemplateDescriptor, LowercaseFontFamilyName,
 };
 
-pub static SANS_SERIF_FONT_FAMILY: &str = "Arial";
-
-pub fn system_default_family(_: &str) -> Option<String> {
-    Some("Verdana".to_owned())
-}
-
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
-    F: FnMut(String),
+    F: FnMut(&str),
 {
     let system_fc = FontCollection::system();
     for family in system_fc.families_iter() {
-        callback(family.name());
+        if let Ok(family_name) = family.family_name() {
+            callback(&family_name);
+        }
     }
 }
 
-/// An identifier for a local font on a Windows system.
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub struct LocalFontIdentifier {
-    /// The FontDescriptor of this font.
-    #[ignore_malloc_size_of = "dwrote does not support MallocSizeOf"]
-    pub font_descriptor: Arc<FontDescriptor>,
-}
-
-impl LocalFontIdentifier {
-    pub fn index(&self) -> u32 {
-        FontCollection::system()
-            .get_font_from_descriptor(&self.font_descriptor)
-            .map_or(0, |font| font.create_font_face().get_index())
-    }
-
-    pub(crate) fn read_data_from_file(&self) -> Vec<u8> {
-        let font = FontCollection::system()
-            .get_font_from_descriptor(&self.font_descriptor)
-            .unwrap();
-        let face = font.create_font_face();
-        let files = face.get_files();
-        assert!(!files.is_empty());
-        files[0].get_font_file_bytes()
-    }
-}
-
-impl Eq for LocalFontIdentifier {}
-
-impl Hash for LocalFontIdentifier {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.font_descriptor.family_name.hash(state);
-        self.font_descriptor.weight.to_u32().hash(state);
-        self.font_descriptor.stretch.to_u32().hash(state);
-        self.font_descriptor.style.to_u32().hash(state);
-    }
-}
-
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
     let system_fc = FontCollection::system();
-    if let Some(family) = system_fc.get_font_family_by_name(family_name) {
+    if let Ok(Some(family)) = system_fc.font_family_by_name(family_name) {
         let count = family.get_font_count();
         for i in 0..count {
-            let font = family.get_font(i);
-            let template_descriptor = (&font).into();
+            let Ok(font) = family.font(i) else {
+                continue;
+            };
+            let template_descriptor = font_template_descriptor_from_font(&font);
             let local_font_identifier = LocalFontIdentifier {
                 font_descriptor: Arc::new(font.to_descriptor()),
             };
-            callback(FontTemplate::new_for_local_font(
-                local_font_identifier,
+            callback(FontTemplate::new(
+                FontIdentifier::Local(local_font_identifier),
                 template_descriptor,
+                None,
             ))
         }
     }
@@ -353,27 +315,39 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-impl From<&Font> for FontTemplateDescriptor {
-    fn from(font: &Font) -> Self {
-        let style = match font.style() {
-            FontStyle::Normal => StyleFontStyle::NORMAL,
-            FontStyle::Oblique => StyleFontStyle::OBLIQUE,
-            FontStyle::Italic => StyleFontStyle::ITALIC,
-        };
-        let weight = StyleFontWeight::from_float(font.weight().to_u32() as f32);
-        let stretch = match font.stretch() {
-            FontStretch::Undefined => FontStretchKeyword::Normal,
-            FontStretch::UltraCondensed => FontStretchKeyword::UltraCondensed,
-            FontStretch::ExtraCondensed => FontStretchKeyword::ExtraCondensed,
-            FontStretch::Condensed => FontStretchKeyword::Condensed,
-            FontStretch::SemiCondensed => FontStretchKeyword::SemiCondensed,
-            FontStretch::Normal => FontStretchKeyword::Normal,
-            FontStretch::SemiExpanded => FontStretchKeyword::SemiExpanded,
-            FontStretch::Expanded => FontStretchKeyword::Expanded,
-            FontStretch::ExtraExpanded => FontStretchKeyword::ExtraExpanded,
-            FontStretch::UltraExpanded => FontStretchKeyword::UltraExpanded,
-        }
-        .compute();
-        FontTemplateDescriptor::new(weight, stretch, style)
+fn font_template_descriptor_from_font(font: &Font) -> FontTemplateDescriptor {
+    let style = match font.style() {
+        FontStyle::Normal => StyleFontStyle::NORMAL,
+        FontStyle::Oblique => StyleFontStyle::OBLIQUE,
+        FontStyle::Italic => StyleFontStyle::ITALIC,
+    };
+    let weight = StyleFontWeight::from_float(font.weight().to_u32() as f32);
+    let width = match font.stretch() {
+        FontStretch::Undefined => FontWidthKeyword::Normal,
+        FontStretch::UltraCondensed => FontWidthKeyword::UltraCondensed,
+        FontStretch::ExtraCondensed => FontWidthKeyword::ExtraCondensed,
+        FontStretch::Condensed => FontWidthKeyword::Condensed,
+        FontStretch::SemiCondensed => FontWidthKeyword::SemiCondensed,
+        FontStretch::Normal => FontWidthKeyword::Normal,
+        FontStretch::SemiExpanded => FontWidthKeyword::SemiExpanded,
+        FontStretch::Expanded => FontWidthKeyword::Expanded,
+        FontStretch::ExtraExpanded => FontWidthKeyword::ExtraExpanded,
+        FontStretch::UltraExpanded => FontWidthKeyword::UltraExpanded,
     }
+    .compute();
+    FontTemplateDescriptor::new(weight, width, style)
+}
+
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
+    match generic {
+        GenericFontFamily::None | GenericFontFamily::Serif => "Times New Roman",
+        GenericFontFamily::SansSerif => "Arial",
+        GenericFontFamily::Monospace => "Courier New",
+        GenericFontFamily::Cursive => "Comic Sans MS",
+        GenericFontFamily::Fantasy => "Impact",
+        GenericFontFamily::SystemUi => "Segoe UI",
+    }
+    .into()
 }

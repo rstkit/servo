@@ -6,6 +6,7 @@
 #![crate_name = "servo_url"]
 #![crate_type = "rlib"]
 
+pub mod encoding;
 pub mod origin;
 
 use std::collections::hash_map::DefaultHasher;
@@ -14,15 +15,15 @@ use std::hash::Hasher;
 use std::net::IpAddr;
 use std::ops::{Index, Range, RangeFrom, RangeFull, RangeTo};
 use std::path::Path;
+use std::str::FromStr;
 
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc;
-use to_shmem::{SharedMemoryBuilder, ToShmem};
 pub use url::Host;
 use url::{Position, Url};
 
-pub use crate::origin::{ImmutableOrigin, MutableOrigin, OpaqueOrigin};
+pub use crate::origin::{ImmutableOrigin, MutableOrigin, OpaqueOrigin, OriginSnapshot};
 
 const DATA_URL_DISPLAY_LENGTH: usize = 40;
 
@@ -36,13 +37,7 @@ pub enum UrlError {
 }
 
 #[derive(Clone, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct ServoUrl(#[ignore_malloc_size_of = "Arc"] Arc<Url>);
-
-impl ToShmem for ServoUrl {
-    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> to_shmem::Result<Self> {
-        unimplemented!("If servo wants to share stylesheets across processes, ToShmem for Url must be implemented")
-    }
-}
+pub struct ServoUrl(#[conditional_malloc_size_of] Arc<Url>);
 
 impl ServoUrl {
     pub fn from_url(url: Url) -> Self {
@@ -57,7 +52,7 @@ impl ServoUrl {
     }
 
     pub fn into_string(self) -> String {
-        String::from(self.into_url())
+        String::from(self.as_url().as_str())
     }
 
     pub fn into_url(self) -> Url {
@@ -93,7 +88,7 @@ impl ServoUrl {
     }
 
     pub fn origin(&self) -> ImmutableOrigin {
-        ImmutableOrigin::new(self.0.origin())
+        ImmutableOrigin::new(self.as_url())
     }
 
     pub fn scheme(&self) -> &str {
@@ -109,6 +104,24 @@ impl ServoUrl {
     pub fn is_local_scheme(&self) -> bool {
         let scheme = self.scheme();
         scheme == "about" || scheme == "blob" || scheme == "data"
+    }
+
+    /// <https://url.spec.whatwg.org/#special-scheme>
+    pub fn is_special_scheme(&self) -> bool {
+        let scheme = self.scheme();
+        scheme == "ftp" ||
+            scheme == "file" ||
+            scheme == "http" ||
+            scheme == "https" ||
+            scheme == "ws" ||
+            scheme == "wss"
+    }
+
+    /// <https://url.spec.whatwg.org/#url-equivalence>
+    /// In the future this may be removed if the helper is added upstream in rust-url
+    /// see <https://github.com/servo/rust-url/issues/1063> for details
+    pub fn is_equal_excluding_fragments(&self, other: &ServoUrl) -> bool {
+        self.0[..Position::AfterQuery] == other.0[..Position::AfterQuery]
     }
 
     pub fn as_str(&self) -> &str {
@@ -173,7 +186,7 @@ impl ServoUrl {
         self.0.join(input).map(Self::from_url)
     }
 
-    pub fn path_segments(&self) -> Option<::std::str::Split<char>> {
+    pub fn path_segments(&self) -> Option<::std::str::Split<'_, char>> {
         self.0.path_segments()
     }
 
@@ -222,42 +235,40 @@ impl ServoUrl {
 
     /// <https://w3c.github.io/webappsec-secure-contexts/#potentially-trustworthy-url>
     pub fn is_potentially_trustworthy(&self) -> bool {
-        // Step 1
+        // Step 1. If url is "about:blank" or "about:srcdoc", return "Potentially Trustworthy".
         if self.as_str() == "about:blank" || self.as_str() == "about:srcdoc" {
             return true;
         }
-        // Step 2
+
+        // Step 2. If url’s scheme is "data", return "Potentially Trustworthy".
         if self.scheme() == "data" {
             return true;
         }
-        // Step 3
-        self.is_origin_trustworthy()
+
+        // Step 3. Return the result of executing § 3.1 Is origin potentially trustworthy? on url’s origin.
+        self.origin().is_potentially_trustworthy()
     }
 
-    /// <https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy>
-    pub fn is_origin_trustworthy(&self) -> bool {
-        // Step 1
-        if !self.origin().is_tuple() {
+    /// <https://html.spec.whatwg.org/multipage/#matches-about:blank>
+    pub fn matches_about_blank(&self) -> bool {
+        // A URL matches about:blank if
+
+        // its scheme is "about",
+        if self.scheme() != "about" {
             return false;
         }
 
-        // Step 3
-        if self.scheme() == "https" || self.scheme() == "wss" {
-            true
-        // Steps 4-5
-        } else if self.host().is_some() {
-            let host = self.host_str().unwrap();
-            // Step 4
-            if let Ok(ip_addr) = host.parse::<IpAddr>() {
-                ip_addr.is_loopback()
-            // Step 5
-            } else {
-                host == "localhost" || host.ends_with(".localhost")
-            }
-        // Step 6
-        } else {
-            self.scheme() == "file"
-        }
+        // its path contains a single string "blank",
+        let path_is_blank = self.0.path() == "blank";
+
+        // its username and password are the empty string,
+        let empty_username_and_password =
+            self.0.username().is_empty() && self.0.password().is_none();
+
+        // and its host is null.
+        let null_host = self.0.host().is_none();
+
+        path_is_blank && empty_username_and_password && null_host
     }
 }
 
@@ -326,5 +337,14 @@ impl From<Url> for ServoUrl {
 impl From<Arc<Url>> for ServoUrl {
     fn from(url: Arc<Url>) -> Self {
         ServoUrl(url)
+    }
+}
+
+impl FromStr for ServoUrl {
+    type Err = <Url as FromStr>::Err;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let url = Url::from_str(value)?;
+        Ok(url.into())
     }
 }

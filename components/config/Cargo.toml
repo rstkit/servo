@@ -1,29 +1,25 @@
 [package]
-name = "servo_config"
+name = "servo-config"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [lib]
 name = "servo_config"
 path = "lib.rs"
 
 [dependencies]
-embedder_traits = { workspace = true }
-euclid = { workspace = true }
-getopts = { workspace = true }
-lazy_static = { workspace = true }
-log = { workspace = true }
-num_cpus = { workspace = true }
+num_enum = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-servo_config_plugins = { path = "../config_plugins" }
-servo_geometry = { path = "../geometry" }
-servo_url = { path = "../url" }
-style_config = { workspace = true }
-url = { workspace = true }
+servo-config-macro = { workspace = true }
+strum = { workspace = true }
+stylo_static_prefs = { workspace = true }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
-dirs-next = "2.0"
+[lints]
+workspace = true

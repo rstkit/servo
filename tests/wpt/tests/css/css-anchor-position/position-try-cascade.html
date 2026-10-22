@@ -18,7 +18,7 @@
     top: 0px;
     width: 150px; /* force fallback */
     height: 25px;
-    position-try-options: --pf;
+    position-try-fallbacks: --pf;
   }
   @position-try --pf {
     width: 50px;
@@ -87,9 +87,14 @@
 
 <!-- Transitions -->
 <style>
-  #abs_transition.move {
-    top: 10px !important;
-    transition: top 1000s steps(2, start);
+  #abs_transition {
+    top: 50px;
+
+    &.move {
+      top: 10px !important;
+      transition: top 1000s steps(2, start);
+    }
+  }
 </style>
 <div class=cb>
   <div id=abs_transition class=abs></div>
@@ -106,7 +111,7 @@
 <!-- revert / revert-layer -->
 <style>
   #abs_revert {
-    position-try-options: --pf-revert;
+    position-try-fallbacks: --pf-revert;
   }
   @layer author-layer {
     #abs_revert {
@@ -128,7 +133,7 @@
     height: 30px;
   }
 </style>
-<div class=cb class=abs>
+<div class=cb>
   <div id=abs_revert class=abs></div>
 </div>
 <script>

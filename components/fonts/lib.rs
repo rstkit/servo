@@ -5,37 +5,50 @@
 #![deny(unsafe_code)]
 
 mod font;
-mod font_cache_thread;
 mod font_context;
+pub mod font_feature_values;
 mod font_store;
-mod font_template;
 mod glyph;
-#[allow(unsafe_code)]
-pub mod platform;
-mod shaper;
+#[expect(unsafe_code)]
+pub mod platform; // Public because integration tests need this
+mod shapers;
+mod system_font_service;
 
-pub use font::*;
-pub use font_cache_thread::*;
-pub use font_context::*;
-pub use font_store::*;
-pub use font_template::*;
-pub use glyph::*;
-pub use shaper::*;
-use unicode_properties::{emoji, EmojiStatus, UnicodeEmoji};
+pub(crate) use font::*;
+// These items are not meant to be part of the public API but are used for integration tests
+pub use font::{Font, FontFamilyDescriptor, FontSearchScope, PlatformFontMethods};
+pub use font::{
+    FontBaseline, FontGroup, FontMetrics, FontRef, LAST_RESORT_GLYPH_ADVANCE, ShapingFlags,
+    ShapingOptions,
+};
+pub use font_context::{
+    CspViolationHandler, FontContext, FontContextWebFontMethods, NetworkTimingHandler,
+    WebFontDocumentContext,
+};
+pub use font_store::FontTemplates;
+pub use fonts_traits::*;
+pub(crate) use glyph::*;
+pub use glyph::{GlyphInfo, ShapedText, ShapedTextSlice, ShapedTextSlicer, TrailingWhiteSpace};
+use icu_locale_core::subtags::Language;
+pub use platform::font_list::fallback_font_families;
+pub(crate) use shapers::*;
+pub use system_font_service::SystemFontService;
+use unicode_properties::{EmojiStatus, UnicodeEmoji, emoji};
 
 /// Whether or not font fallback selection prefers the emoji or text representation
 /// of a character. If `None` then either presentation is acceptable.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EmojiPresentationPreference {
+pub(crate) enum EmojiPresentationPreference {
     None,
     Text,
     Emoji,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FallbackFontSelectionOptions {
-    pub character: char,
-    pub presentation_preference: EmojiPresentationPreference,
+    pub(crate) character: char,
+    pub(crate) presentation_preference: EmojiPresentationPreference,
+    pub(crate) language: Language,
 }
 
 impl Default for FallbackFontSelectionOptions {
@@ -43,12 +56,13 @@ impl Default for FallbackFontSelectionOptions {
         Self {
             character: ' ',
             presentation_preference: EmojiPresentationPreference::None,
+            language: Language::UNKNOWN,
         }
     }
 }
 
 impl FallbackFontSelectionOptions {
-    pub fn new(character: char, next_character: Option<char>) -> Self {
+    pub fn new(character: char, next_character: Option<char>, language: Language) -> Self {
         let presentation_preference = match next_character {
             Some(next_character) if emoji::is_emoji_presentation_selector(next_character) => {
                 EmojiPresentationPreference::Emoji
@@ -76,6 +90,7 @@ impl FallbackFontSelectionOptions {
         Self {
             character,
             presentation_preference,
+            language,
         }
     }
 }

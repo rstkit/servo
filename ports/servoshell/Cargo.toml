@@ -5,7 +5,10 @@ version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = false
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [lib]
 name = "servoshell"
@@ -13,106 +16,158 @@ path = "lib.rs"
 bench = false
 
 [[bin]]
-name = "servo"
+name = "servoshell"
 path = "main.rs"
 bench = false
 
-# Some of these dependencies are only needed for a specific target os, but
-# since build-scripts can't detect the cargo target os at build-time, we
-# must unconditionally add these dependencies. See https://github.com/rust-lang/cargo/issues/4932
-[build-dependencies]
-vergen = { version = "8.3.1", features = ["git", "git2"] }
-# Android and OpenHarmony
-gl_generator = "0.14"
-# MacOS only
-cc = "1.0"
+[lints]
+workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
+winresource = { workspace = true }
 
-[package.metadata.winres]
-FileDescription = "Servo"
+[package.metadata.winresource]
+FileDescription = "ServoShell"
 LegalCopyright = "© The Servo Project Developers"
-OriginalFilename = "servo.exe"
-ProductName = "Servo"
+OriginalFilename = "servoshell.exe"
+ProductName = "ServoShell"
 
 [features]
-debugmozjs = ["libservo/debugmozjs"]
-default = ["max_log_level", "webdriver"]
-jitspew = ["libservo/jitspew"]
-js_backtrace = ["libservo/js_backtrace"]
+# Don't add new features to `default` directly. Add to `default_base` instead.
+default = ["default_base", "media-gstreamer"]
+# Feature groups:
+# Base default features, without GStreamer media support.
+default_base = [
+    "bundled",
+    "default_web_features",
+    "default_tooling",
+    "jemalloc",
+    "max_log_level",
+    "multiprocess",
+    "js_jit",
+]
+# Enable jemalloc on platforms that support it (not OHOS and not Windows).
+jemalloc = ["servo-allocator/use-jemalloc"]
+# Default web features should be kept in sync with the list in servo/Cargo.toml.
+# We also need to enable our own features, since we also have `cfg` gated code here.
+default_web_features = ["servo/default_web_features", "gamepad", "webgpu", "webgl", "webxr"]
+default_tooling = ["servo/default_tooling", "devtools"]
+# Bundle required resources in the binary.
+bundled = ["servo/bundled"]
+
+## Individual features below this line
+baked-in-resources = ["servo/baked-in-resources"]
+bundled_freetype = ["servo/bundled_freetype"]
+crown = ["servo/crown"]
+debugmozjs = ["servo/debugmozjs"]
+devtools = ["servo/devtools"]
+gamepad = ["servo/gamepad"]
+jitspew = ["servo/jitspew"]
+js_backtrace = ["servo/js_backtrace"]
+js_jit = ["servo/js_jit"]
 max_log_level = ["log/release_max_level_info"]
-media-gstreamer = ["libservo/media-gstreamer"]
-multiview = ["libservo/multiview"]
-native-bluetooth = ["libservo/native-bluetooth"]
-no-wgl = ["libservo/no-wgl"]
-profilemozjs = ["libservo/profilemozjs"]
-refcell_backtrace = ["libservo/refcell_backtrace"]
-webdriver = ["libservo/webdriver"]
-webgl_backtrace = ["libservo/webgl_backtrace"]
-xr-profile = ["libservo/xr-profile"]
+media-gstreamer = ["servo/media-gstreamer"]
+multiprocess = ["servo/multiprocess"]
+native-bluetooth = ["servo/native-bluetooth"]
+profilemozjs = ["servo/profilemozjs"]
+tracing = ["dep:tracing", "dep:tracing-subscriber", "servo/tracing"]
+tracing-hitrace = ["tracing", "dep:hitrace"]
+tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
+vello = ["servo/vello"]
+webgl_backtrace = ["servo/webgl_backtrace"]
+webgl = ["servo/webgl"]
+webgpu = ["servo/webgpu"]
+webxr = ["servo/webxr"]
 
 [dependencies]
-libc = { workspace = true }
-libservo = { path = "../../components/servo" }
+accesskit = { workspace = true }
+bpaf = { workspace = true, features = ["derive"] }
 cfg-if = { workspace = true }
+crossbeam-channel = { workspace = true }
+dpi = { workspace = true }
+euclid = { workspace = true }
+hitrace = { workspace = true, optional = true }
+image = { workspace = true }
+keyboard-types = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
-lazy_static = { workspace = true }
-getopts = { workspace = true }
+mime_guess = { workspace = true }
+raw-window-handle = { workspace = true }
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+servo = { workspace = true, features = ["background_hang_monitor", "bluetooth", "testbinding"], default-features = false }
+tokio = { workspace = true }
+tracing = { workspace = true, optional = true }
+tracing-perfetto = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true, features = ["env-filter"] }
 url = { workspace = true }
-servo-media = { workspace = true }
-
+webdriver_server = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
-ipc-channel = { workspace = true }
-jni = "0.21.1"
-libloading = "0.8"
-serde_json = { workspace = true }
-surfman = { workspace = true, features = ["sm-angle-default"] }
-webxr = { git = "https://github.com/servo/webxr" }
-
+android_logger = { workspace = true }
+jni = { workspace = true }
+# https://github.com/servo/servo/issues/32175
+# By default Android enforce the tagged pointers feature, which does not work well with mozjs.
+# Like Gecko, replace the system allocator with jemalloc.
+servo-allocator = { workspace = true, features = ["use-jemalloc"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 backtrace = { workspace = true }
 
 [target.'cfg(target_env = "ohos")'.dependencies]
-# force inprocess, until libc-rs 0.2.156 is released containing
-# https://github.com/rust-lang/libc/commit/9e248e212c5602cb4e98676e4c21ea0382663a12
+env_filter = { workspace = true }
+euclid = { workspace = true }
+hilog = { workspace = true }
+# force inprocess until we add multi-process support for ohos
 ipc-channel = { workspace = true, features = ["force-inprocess"] }
-hilog = "0.1.0"
-napi-derive-ohos = "0.0.9"
-napi-ohos = "0.1"
-serde_json = { workspace = true }
-surfman = { workspace = true, features = ["sm-angle-default"] }
-webxr = { git = "https://github.com/servo/webxr" }
-ohos-sys = { git = "https://github.com/jschwe/ohos-sys.git" }
+napi-derive-ohos = { workspace = true }
+napi-ohos = { workspace = true }
+ohos-abilitykit-sys = { workspace = true, features = ["api-14"] }
+ohos-deviceinfo = { workspace = true }
+ohos-ime = { workspace = true }
+ohos-ime-sys = { workspace = true }
+ohos-vsync = { workspace = true }
+ohos-window-sys = { workspace = true }
+ohos-sys-opaque-types = { workspace = true }
+ohos-window-manager-sys = { workspace = true, features = ["api-14"] }
+xcomponent-sys = { workspace = true, features = ["api-20", "keyboard-types"] }
 
+[target.'cfg(any(target_os = "android", target_env = "ohos"))'.dependencies]
+nix = { workspace = true, features = ["fs"] }
+serde_json = { workspace = true }
+servo-base = { workspace = true }
+surfman = { workspace = true, features = ["sm-angle-default"] }
 
 [target.'cfg(not(any(target_os = "android", target_env = "ohos")))'.dependencies]
-# For optional feature servo_allocator/use-system-allocator
-servo_allocator = { path = "../../components/allocator" }
-arboard = { version = "3" }
-egui = { version = "0.26.2" }
-egui_glow = { version = "0.26.2", features = ["winit"] }
-egui-winit = { version = "0.26.2", default-features = false, features = ["clipboard", "wayland"] }
-euclid = { workspace = true }
-gilrs = "0.10.7"
-gleam = { workspace = true }
-glow = "0.13.1"
-keyboard-types = { workspace = true }
-raw-window-handle = "0.6"
-shellwords = "1.0.0"
-surfman = { workspace = true, features = ["sm-x11", "sm-raw-window-handle-06"] }
-tinyfiledialogs = "3.0"
-webxr = { git = "https://github.com/servo/webxr", features = ["ipc", "glwindow", "headless"] }
-winit = "0.29.10"
+dirs = { workspace = true }
+egui = { workspace = true }
+egui-file-dialog = { workspace = true }
+egui-winit = { workspace = true, features = ["accesskit", "clipboard", "wayland"] }
+egui_glow = { workspace = true, features = ["winit"] }
+gilrs = { workspace = true }
+glow = { workspace = true }
+headers = { workspace = true }
+serde_json = { workspace = true }
+# For optional feature servo-allocator/use-jemalloc and servo-allocator/allocation-tracking
+servo-allocator = { workspace = true }
+surfman = { workspace = true, features = ["sm-x11"] }
+winit = { workspace = true }
 
-[target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))'.dependencies]
-image = { workspace = true }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-sig = "1.0"
+[target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))'.dependencies]
+signal-hook-registry = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi"] }
+servo = { workspace = true, features = ["no-wgl"] }
+windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_System_Console"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = [
+    "std",
+    "NSColorSpace",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { workspace = true, features = [
+    "std",
+] }

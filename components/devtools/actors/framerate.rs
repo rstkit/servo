@@ -3,75 +3,68 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::mem;
-use std::net::TcpStream;
 
-use base::id::PipelineId;
+use atomic_refcell::AtomicRefCell;
 use devtools_traits::DevtoolScriptControlMsg;
-use ipc_channel::ipc::IpcSender;
-use serde_json::{Map, Value};
+use malloc_size_of_derive::MallocSizeOf;
+use servo_base::generic_channel::GenericSender;
+use servo_base::id::PipelineId;
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorRegistry, new_actor_name};
 use crate::actors::timeline::HighResolutionStamp;
-use crate::StreamId;
 
-pub struct FramerateActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct FramerateActor {
     name: String,
-    pipeline: PipelineId,
-    script_sender: IpcSender<DevtoolScriptControlMsg>,
-
+    pipeline_id: PipelineId,
+    script_sender: GenericSender<DevtoolScriptControlMsg>,
     is_recording: bool,
-    ticks: Vec<HighResolutionStamp>,
+    ticks: AtomicRefCell<Vec<HighResolutionStamp>>,
 }
 
 impl Actor for FramerateActor {
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn handle_message(
-        &self,
-        _registry: &ActorRegistry,
-        _msg_type: &str,
-        _msg: &Map<String, Value>,
-        _stream: &mut TcpStream,
-        _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(ActorMessageStatus::Ignored)
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
 impl FramerateActor {
-    /// return name of actor
+    /// Return name of actor
     pub fn create(
         registry: &ActorRegistry,
         pipeline_id: PipelineId,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
     ) -> String {
-        let actor_name = registry.new_name("framerate");
+        let actor_name = new_actor_name::<Self>();
         let mut actor = FramerateActor {
             name: actor_name.clone(),
-            pipeline: pipeline_id,
+            pipeline_id,
             script_sender,
             is_recording: false,
-            ticks: Vec::new(),
+            ticks: Default::default(),
         };
 
         actor.start_recording();
-        registry.register_later(Box::new(actor));
+        registry.register(actor);
         actor_name
     }
 
-    pub fn add_tick(&mut self, tick: f64) {
-        self.ticks.push(HighResolutionStamp::wrap(tick));
+    pub fn add_tick(&self, tick: f64) {
+        self.ticks
+            .borrow_mut()
+            .push(HighResolutionStamp::wrap(tick));
 
         if self.is_recording {
-            let msg = DevtoolScriptControlMsg::RequestAnimationFrame(self.pipeline, self.name());
+            let msg = DevtoolScriptControlMsg::RequestAnimationFrame(
+                self.pipeline_id,
+                self.name().into(),
+            );
             self.script_sender.send(msg).unwrap();
         }
     }
 
-    pub fn take_pending_ticks(&mut self) -> Vec<HighResolutionStamp> {
-        mem::take(&mut self.ticks)
+    pub fn take_pending_ticks(&self) -> Vec<HighResolutionStamp> {
+        mem::take(&mut self.ticks.borrow_mut())
     }
 
     fn start_recording(&mut self) {
@@ -81,7 +74,8 @@ impl FramerateActor {
 
         self.is_recording = true;
 
-        let msg = DevtoolScriptControlMsg::RequestAnimationFrame(self.pipeline, self.name());
+        let msg =
+            DevtoolScriptControlMsg::RequestAnimationFrame(self.pipeline_id, self.name().into());
         self.script_sender.send(msg).unwrap();
     }
 

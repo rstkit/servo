@@ -1,6 +1,6 @@
 import pytest
-from tests.support.sync import AsyncPoll
 from webdriver.error import TimeoutException
+
 
 pytestmark = pytest.mark.asyncio
 
@@ -8,8 +8,9 @@ USER_PROMPT_CLOSED_EVENT = "browsingContext.userPromptClosed"
 USER_PROMPT_OPENED_EVENT = "browsingContext.userPromptOpened"
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 async def test_unsubscribe(
-    bidi_session, inline, new_tab, wait_for_event, wait_for_future_safe
+    bidi_session, inline, new_tab, wait_for_event, wait_for_bidi_events, wait_for_future_safe
 ):
     await bidi_session.session.subscribe(
         events=[USER_PROMPT_CLOSED_EVENT, USER_PROMPT_OPENED_EVENT]
@@ -38,13 +39,13 @@ async def test_unsubscribe(
 
     await bidi_session.browsing_context.handle_user_prompt(context=new_tab["context"])
 
-    wait = AsyncPoll(bidi_session, timeout=0.5)
     with pytest.raises(TimeoutException):
-        await wait.until(lambda _: len(events) > 0)
+        await wait_for_bidi_events(events, 1, timeout=0.5)
 
     remove_listener()
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 async def test_prompt_type_alert(
     bidi_session,
     subscribe_events,
@@ -74,9 +75,12 @@ async def test_prompt_type_alert(
     assert event == {
         "context": new_tab["context"],
         "accepted": True,
+        "type": "alert",
+        **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
     }
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 @pytest.mark.parametrize("accept", [True, False])
 async def test_prompt_type_confirm(
     bidi_session,
@@ -110,9 +114,12 @@ async def test_prompt_type_confirm(
     assert event == {
         "context": new_tab["context"],
         "accepted": accept,
+        "type": "confirm",
+        **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
     }
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 @pytest.mark.parametrize("accept", [True, False])
 async def test_prompt_type_prompt(
     bidi_session,
@@ -148,15 +155,20 @@ async def test_prompt_type_prompt(
         assert event == {
             "context": new_tab["context"],
             "accepted": accept,
+            "type": "prompt",
             "userText": test_user_text,
+            **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
         }
     else:
         assert event == {
             "context": new_tab["context"],
             "accepted": accept,
+            "type": "prompt",
+            **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
         }
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 async def test_prompt_with_defaults(
     bidi_session,
     subscribe_events,
@@ -186,15 +198,19 @@ async def test_prompt_with_defaults(
     assert event == {
         "context": new_tab["context"],
         "accepted": True,
+        "type": "prompt",
+        **({"userContext": new_tab["userContext"]} if "userContext" in event else {})
     }
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 @pytest.mark.parametrize("type_hint", ["tab", "window"])
 async def test_subscribe_to_one_context(
     bidi_session,
     subscribe_events,
     inline,
     wait_for_event,
+    wait_for_bidi_events,
     wait_for_future_safe,
     type_hint,
 ):
@@ -237,9 +253,8 @@ async def test_subscribe_to_one_context(
     )
 
     # Make sure we don't receive this event.
-    wait = AsyncPoll(bidi_session, timeout=0.5)
     with pytest.raises(TimeoutException):
-        await wait.until(lambda _: len(events) > 0)
+        await wait_for_bidi_events(events, 1, timeout=0.5)
 
     on_prompt_opened = wait_for_event(USER_PROMPT_OPENED_EVENT)
     on_prompt_closed = wait_for_event(USER_PROMPT_CLOSED_EVENT)
@@ -260,6 +275,8 @@ async def test_subscribe_to_one_context(
     assert event == {
         "context": new_context["context"],
         "accepted": True,
+        "type": "alert",
+        **({"userContext": new_context["userContext"]} if "userContext" in event else {})
     }
 
     remove_listener()
@@ -267,6 +284,7 @@ async def test_subscribe_to_one_context(
     await bidi_session.browsing_context.close(context=another_new_context["context"])
 
 
+@pytest.mark.capabilities({"unhandledPromptBehavior": {'default': 'ignore'}})
 async def test_iframe(
     bidi_session,
     new_tab,
@@ -305,6 +323,8 @@ async def test_iframe(
     event = await wait_for_future_safe(on_prompt_closed)
 
     assert event == {
-        "context": new_tab["context"],
+        "context": frame["context"],
         "accepted": True,
+        "type": "alert",
+        **({"userContext": frame["userContext"]} if "userContext" in event else {})
     }

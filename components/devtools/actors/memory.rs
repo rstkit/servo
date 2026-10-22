@@ -2,72 +2,60 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::net::TcpStream;
-
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
-use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::StreamId;
+use crate::actor::{Actor, ActorRegistry, new_actor_name};
 
 #[derive(Serialize)]
-pub struct TimelineMemoryReply {
-    jsObjectSize: u64,
-    jsStringSize: u64,
-    jsOtherSize: u64,
-    domSize: u64,
-    styleSize: u64,
-    otherSize: u64,
-    totalSize: u64,
-    jsMilliseconds: f64,
-    nonJSMilliseconds: f64,
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TimelineMemoryReply {
+    js_object_size: u64,
+    js_string_size: u64,
+    js_other_size: u64,
+    dom_size: u64,
+    style_size: u64,
+    other_size: u64,
+    total_size: u64,
+    js_milliseconds: f64,
+    #[serde(rename = "nonJSMilliseconds")]
+    non_js_milliseconds: f64,
 }
 
-pub struct MemoryActor {
-    pub name: String,
+#[derive(MallocSizeOf)]
+pub(crate) struct MemoryActor {
+    name: String,
 }
 
 impl Actor for MemoryActor {
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn handle_message(
-        &self,
-        _registry: &ActorRegistry,
-        _msg_type: &str,
-        _msg: &Map<String, Value>,
-        _stream: &mut TcpStream,
-        _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(ActorMessageStatus::Ignored)
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
 impl MemoryActor {
     /// return name of actor
     pub fn create(registry: &ActorRegistry) -> String {
-        let actor_name = registry.new_name("memory");
+        let actor_name = new_actor_name::<Self>();
         let actor = MemoryActor {
             name: actor_name.clone(),
         };
 
-        registry.register_later(Box::new(actor));
+        registry.register(actor);
         actor_name
     }
 
     pub fn measure(&self) -> TimelineMemoryReply {
-        //TODO:
         TimelineMemoryReply {
-            jsObjectSize: 1,
-            jsStringSize: 1,
-            jsOtherSize: 1,
-            domSize: 1,
-            styleSize: 1,
-            otherSize: 1,
-            totalSize: 1,
-            jsMilliseconds: 1.1,
-            nonJSMilliseconds: 1.1,
+            js_object_size: 1,
+            js_string_size: 1,
+            js_other_size: 1,
+            dom_size: 1,
+            style_size: 1,
+            other_size: 1,
+            total_size: 1,
+            js_milliseconds: 1.1,
+            non_js_milliseconds: 1.1,
         }
     }
 }

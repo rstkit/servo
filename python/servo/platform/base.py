@@ -10,33 +10,50 @@
 import os
 import shutil
 import subprocess
-from typing import Optional
+from typing import Optional, Tuple
+
+from .build_target import BuildTarget, OpenHarmonyTarget
+
+
+def clap_tool_already_installed(name: str, minimum_version: Optional[Tuple[int, int, int]] = None) -> bool:
+    """
+    Returns true if the tool `name` is already installed and in PATH.
+    If `minimum_version` is specified, additionally checks if the version tuple is newer than the minimum version.
+    This assumes the CLI uses clap, although other argument parsers that output `name X.Y.Z` for `name --version`
+    will also work.
+    """
+    if not shutil.which(name):
+        return False
+    result = subprocess.run([name, "--version"], encoding="utf-8", capture_output=True)
+    if minimum_version is not None:
+        (major, minor, micro) = result.stdout.strip().split(" ")[1].split(".", 2)
+        return (int(major), int(minor), int(micro)) >= minimum_version
+    else:
+        return True
 
 
 class Base:
-    def __init__(self, triple: str):
+    def __init__(self, triple: str) -> None:
         self.environ = os.environ.copy()
         self.triple = triple
         self.is_windows = False
         self.is_linux = False
         self.is_macos = False
 
-    def gstreamer_root(self, _cross_compilation_target: Optional[str]) -> Optional[str]:
+    def gstreamer_root(self, target: BuildTarget) -> Optional[str]:
         raise NotImplementedError("Do not know how to get GStreamer path for platform.")
 
     def executable_suffix(self) -> str:
         return ""
 
-    def _platform_bootstrap(self, _force: bool) -> bool:
+    def _platform_bootstrap(self, force: bool, yes: bool) -> bool:
         raise NotImplementedError("Bootstrap installation detection not yet available.")
 
-    def _platform_bootstrap_gstreamer(self, _force: bool) -> bool:
-        raise NotImplementedError(
-            "GStreamer bootstrap support is not yet available for your OS."
-        )
+    def _platform_bootstrap_gstreamer(self, target: BuildTarget, force: bool, yes: bool) -> bool:
+        raise NotImplementedError("GStreamer bootstrap support is not yet available for your OS.")
 
-    def is_gstreamer_installed(self, cross_compilation_target: Optional[str]) -> bool:
-        gstreamer_root = self.gstreamer_root(cross_compilation_target)
+    def is_gstreamer_installed(self, target: BuildTarget) -> bool:
+        gstreamer_root = self.gstreamer_root(target)
         if gstreamer_root:
             pkg_config = os.path.join(gstreamer_root, "bin", "pkg-config")
         else:
@@ -54,17 +71,41 @@ class Base:
         except FileNotFoundError:
             return False
 
-    def bootstrap(self, force: bool, skip_platform: bool, skip_lints: bool):
+    def bootstrap(
+        self, force: bool, yes: bool, skip_platform: bool, skip_lints: bool, skip_nextest: bool, install_ohos: bool
+    ) -> None:
         installed_something = False
         if not skip_platform:
-            installed_something |= self._platform_bootstrap(force)
+            installed_something |= self._platform_bootstrap(force, yes)
+        self.install_rust_toolchain()
+        if not skip_nextest:
+            installed_something |= self.install_cargo_nextest(force)
         if not skip_lints:
             installed_something |= self.install_taplo(force)
             installed_something |= self.install_cargo_deny(force)
             installed_something |= self.install_crown(force)
+        # Optional and non-default, since most people won't be compiling for OpenHarmony
+        if install_ohos:
+            installed_something |= self.install_cargo_ohos(force)
+            installed_something |= self.install_ohos_test_runner(force)
 
         if not installed_something:
             print("Dependencies were already installed!")
+
+    def install_rust_toolchain(self) -> None:
+        if shutil.which("rustup") is None:
+            if shutil.which("rustc") is None or shutil.which("cargo") is None:
+                print(" * Warning: rustup, rustc, or cargo not found.")
+                print("   Please install rustup or make sure rustc and cargo are in PATH.")
+            else:
+                print(" * rustup not found. Skipping Rust toolchain installation.")
+            return
+        # rustup 1.28.0, and rustup 1.28.1+ with RUSTUP_AUTO_INSTALL=0, require us to explicitly
+        # install the Rust toolchain before trying to use it.
+        print(" * Installing Rust toolchain...")
+        if subprocess.call(["rustup", "show", "active-toolchain"]) != 0:
+            if subprocess.call(["rustup", "toolchain", "install"]) != 0:
+                raise EnvironmentError("Installation of Rust toolchain failed.")
 
     def install_taplo(self, force: bool) -> bool:
         if not force and shutil.which("taplo") is not None:
@@ -76,14 +117,39 @@ class Base:
 
         return True
 
+    def install_cargo_ohos(self, force: bool) -> bool:
+        (is_installed_and_compatible, _reason) = OpenHarmonyTarget.is_cargo_ohos_compatible()
+        if is_installed_and_compatible and not force:
+            return False
+        print(" * Installing cargo-ohos...")
+        requested_version = OpenHarmonyTarget.REQUESTED_CARGO_OHOS_VERSION
+        if subprocess.call(["cargo", "install", f"cargo-ohos@^{requested_version}", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-ohos failed.")
+        return True
+
+    def install_ohos_test_runner(self, force: bool) -> bool:
+        if not force and clap_tool_already_installed("ohos-test-runner", (0, 1, 6)):
+            return False
+        print(" * Installing ohos-test-runner...")
+        if subprocess.call(["cargo", "install", "ohos-test-runner", "--locked"]) != 0:
+            raise EnvironmentError("Installation of ohos-test-runner failed.")
+        return True
+
     def install_cargo_deny(self, force: bool) -> bool:
-        if not force and shutil.which("cargo-deny") is not None:
+        if not force and clap_tool_already_installed("cargo-deny", (0, 20, 2)):
             return False
 
         print(" * Installing cargo-deny...")
-        if subprocess.call(["cargo", "install", "cargo-deny", "--locked"]) != 0:
+        if subprocess.call(["cargo", "install", "cargo-deny@0.20.2", "--locked"]) != 0:
             raise EnvironmentError("Installation of cargo-deny failed.")
+        return True
 
+    def install_cargo_nextest(self, force: bool) -> bool:
+        if not force and shutil.which("cargo-nextest") is not None:
+            return False
+        print(" * Installing cargo-nextest...")
+        if subprocess.call(["cargo", "install", "cargo-nextest", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-nextest failed.")
         return True
 
     def install_crown(self, force: bool) -> bool:
@@ -95,13 +161,14 @@ class Base:
 
     def passive_bootstrap(self) -> bool:
         """A bootstrap method that is called without explicitly invoking `./mach bootstrap`
-           but that is executed in the process of other `./mach` commands. This should be
-           as fast as possible."""
+        but that is executed in the process of other `./mach` commands. This should be
+        as fast as possible."""
         return False
 
-    def bootstrap_gstreamer(self, force: bool):
-        if not self._platform_bootstrap_gstreamer(force):
-            root = self.gstreamer_root(None)
+    def bootstrap_gstreamer(self, force: bool, yes: bool) -> None:
+        target = BuildTarget.from_triple(self.triple)
+        if not self._platform_bootstrap_gstreamer(target, force, yes):
+            root = self.gstreamer_root(target)
             if root:
                 print(f"GStreamer found at: {root}")
             else:

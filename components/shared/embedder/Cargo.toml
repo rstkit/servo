@@ -1,26 +1,49 @@
 [package]
-name = "embedder_traits"
+name = "servo-embedder-traits"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [lib]
 name = "embedder_traits"
 path = "lib.rs"
 
+[features]
+gamepad = []
+
 [dependencies]
-base = { workspace = true }
-cfg-if = { workspace = true }
+accesskit = { workspace = true }
+bitflags = { workspace = true }
+content-security-policy = { workspace = true }
+cookie = { workspace = true }
 crossbeam-channel = { workspace = true }
-ipc-channel = { workspace = true }
+euclid = { workspace = true }
+http = { workspace = true }
+hyper_serde = { workspace = true }
+image = { workspace = true }
+inventory = { workspace = true }
 keyboard-types = { workspace = true }
-lazy_static = { workspace = true }
 log = { workspace = true }
-num-derive = "0.4"
-num-traits = { workspace = true }
+malloc_size_of = { workspace = true }
+malloc_size_of_derive = { workspace = true }
+pixels = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
-servo_url = { path = "../../url" }
+servo-base = { workspace = true }
+servo-geometry = { workspace = true }
+servo-url = { workspace = true }
+strum = { workspace = true }
+stylo = { workspace = true }
+stylo_traits = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+webdriver = { workspace = true }
 webrender_api = { workspace = true }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
+
+[lints]
+workspace = true

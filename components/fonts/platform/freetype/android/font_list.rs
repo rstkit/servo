@@ -2,47 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
 
-use base::text::{is_cjk, UnicodeBlock, UnicodeBlockMethod};
 use log::warn;
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
-use style::values::computed::{
-    FontStretch as StyleFontStretch, FontStyle as StyleFontStyle, FontWeight as StyleFontWeight,
-};
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod, is_cjk};
 use style::Atom;
+use style::values::computed::font::GenericFontFamily;
+use style::values::computed::{
+    FontStyle as StyleFontStyle, FontWeight as StyleFontWeight, FontWidth as StyleFontWidth,
+};
 
 use super::xml::{Attribute, Node};
-use crate::{FallbackFontSelectionOptions, FontTemplate, FontTemplateDescriptor};
+use crate::{
+    FallbackFontSelectionOptions, FontIdentifier, FontTemplate, FontTemplateDescriptor,
+    LocalFontIdentifier, LowercaseFontFamilyName,
+};
 
-lazy_static::lazy_static! {
-    static ref FONT_LIST: FontList = FontList::new();
-}
-
-/// An identifier for a local font on Android systems.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct LocalFontIdentifier {
-    /// The path to the font.
-    pub path: Atom,
-}
-
-impl LocalFontIdentifier {
-    pub(crate) fn index(&self) -> u32 {
-        0
-    }
-
-    pub(crate) fn read_data_from_file(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        File::open(Path::new(&*self.path))
-            .expect("Couldn't open font file!")
-            .read_to_end(&mut bytes)
-            .unwrap();
-        bytes
-    }
-}
+static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
 
 // Android doesn't provide an API to query system fonts until Android O:
 // https://developer.android.com/reference/android/text/FontConfig.html
@@ -164,7 +141,7 @@ impl FontList {
         let mut result = None;
         paths.iter().all(|path| {
             result = Self::from_path(path);
-            !result.is_some()
+            result.is_none()
         });
 
         if result.is_none() {
@@ -217,10 +194,7 @@ impl FontList {
             }
         }
 
-        Some(FontList {
-            families: families,
-            aliases: aliases,
-        })
+        Some(FontList { families, aliases })
     }
 
     // Fonts expected to exist in Android devices.
@@ -259,11 +233,15 @@ impl FontList {
     }
 
     fn find_family(&self, name: &str) -> Option<&FontFamily> {
-        self.families.iter().find(|f| f.name == name)
+        self.families
+            .iter()
+            .find(|family| family.name.eq_ignore_ascii_case(name))
     }
 
     fn find_alias(&self, name: &str) -> Option<&FontAlias> {
-        self.aliases.iter().find(|f| f.from == name)
+        self.aliases
+            .iter()
+            .find(|family| family.from.eq_ignore_ascii_case(name))
     }
 
     // Parse family and font file names
@@ -296,24 +274,19 @@ impl FontList {
         let mut fonts = Vec::new();
         // Parse font variants
         for node in familyset {
-            match node {
-                Node::Element {
-                    name,
-                    attributes,
-                    children,
-                } => {
-                    if name.local_name == "font" {
-                        FontList::parse_font(&children, attributes, &mut fonts);
-                    }
-                },
-                _ => {},
+            if let Node::Element {
+                name,
+                attributes,
+                children,
+            } = node
+            {
+                if name.local_name == "font" {
+                    FontList::parse_font(children, attributes, &mut fonts);
+                }
             }
         }
 
-        out.push(FontFamily {
-            name: name,
-            fonts: fonts,
-        });
+        out.push(FontFamily { name, fonts });
     }
 
     // Parse family and font file names for Androi API < 21
@@ -358,10 +331,7 @@ impl FontList {
                 .collect();
 
             if !fonts.is_empty() {
-                out.push(FontFamily {
-                    name: name,
-                    fonts: fonts,
-                })
+                out.push(FontFamily { name, fonts })
             }
         }
     }
@@ -412,11 +382,7 @@ impl FontList {
         // Parse optional weight filter
         let weight = Self::find_attrib("weight", attrs).and_then(|w| w.parse().ok());
 
-        out.push(FontAlias {
-            from: from,
-            to: to,
-            weight: weight,
-        })
+        out.push(FontAlias { from, to, weight })
     }
 
     fn find_attrib(name: &str, attrs: &[Attribute]) -> Option<String> {
@@ -427,7 +393,7 @@ impl FontList {
     }
 
     fn text_content(nodes: &[Node]) -> Option<String> {
-        nodes.get(0).and_then(|child| match child {
+        nodes.first().and_then(|child| match child {
             Node::Text(contents) => Some(contents.trim().into()),
             Node::Element { .. } => None,
         })
@@ -446,28 +412,30 @@ impl FontList {
     }
 }
 
-// Functions used by FontCacheThread
-pub fn for_each_available_family<F>(mut callback: F)
+// Functions used by SystemFontSerivce
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
-    F: FnMut(String),
+    F: FnMut(&str),
 {
     for family in &FONT_LIST.families {
-        callback(family.name.clone());
+        callback(&family.name);
     }
     for alias in &FONT_LIST.aliases {
-        callback(alias.from.clone());
+        callback(&alias.from);
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
     let mut produce_font = |font: &Font| {
         let local_font_identifier = LocalFontIdentifier {
             path: Atom::from(FontList::font_absolute_path(&font.filename)),
+            face_index: 0,
+            named_instance_index: 0,
         };
-        let stretch = StyleFontStretch::NORMAL;
+        let width = StyleFontWidth::NORMAL;
         let weight = font
             .weight
             .map(|w| StyleFontWeight::from_float(w as f32))
@@ -484,10 +452,11 @@ where
             },
             None => StyleFontStyle::NORMAL,
         };
-        let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
-        callback(FontTemplate::new_for_local_font(
-            local_font_identifier,
+        let descriptor = FontTemplateDescriptor::new(weight, width, style);
+        callback(FontTemplate::new(
+            FontIdentifier::Local(local_font_identifier),
             descriptor,
+            None,
         ));
     };
 
@@ -508,17 +477,6 @@ where
                 }
             }
         }
-    }
-}
-
-pub fn system_default_family(generic_name: &str) -> Option<String> {
-    if let Some(family) = FONT_LIST.find_family(&generic_name) {
-        Some(family.name.clone())
-    } else if let Some(alias) = FONT_LIST.find_alias(&generic_name) {
-        Some(alias.from.clone())
-    } else {
-        //  First font defined in the fonts.xml is the default on Android.
-        FONT_LIST.families.get(0).map(|family| family.name.clone())
     }
 }
 
@@ -563,6 +521,46 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
                 families.push("Droid Sans Ethiopic");
             },
 
+            UnicodeBlock::Bengali => {
+                families.push("Noto Sans Bengali");
+            },
+
+            UnicodeBlock::Gujarati => {
+                families.push("Noto Sans Gujarati");
+            },
+
+            UnicodeBlock::Gurmukhi => {
+                families.push("Noto Sans Gurmukhi");
+            },
+
+            UnicodeBlock::Oriya => {
+                families.push("Noto Sans Oriya");
+            },
+
+            UnicodeBlock::Kannada => {
+                families.push("Noto Sans Kannada");
+            },
+
+            UnicodeBlock::Telugu => {
+                families.push("Noto Sans Telugu");
+            },
+
+            UnicodeBlock::Malayalam => {
+                families.push("Noto Sans Malayalam");
+            },
+
+            UnicodeBlock::Sinhala => {
+                families.push("Noto Sans Sinhala");
+            },
+
+            UnicodeBlock::Lao => {
+                families.push("Noto Sans Lao");
+            },
+
+            UnicodeBlock::Tibetan => {
+                families.push("Noto Sans Tibetan");
+            },
+
             _ => {
                 if is_cjk(options.character) {
                     families.push("MotoyaLMaru");
@@ -577,4 +575,16 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-pub static SANS_SERIF_FONT_FAMILY: &'static str = "sans-serif";
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
+    match generic {
+        GenericFontFamily::None | GenericFontFamily::Serif => "serif",
+        GenericFontFamily::SansSerif => "sans-serif",
+        GenericFontFamily::Monospace => "monospace",
+        GenericFontFamily::Cursive => "cursive",
+        GenericFontFamily::Fantasy => "serif",
+        GenericFontFamily::SystemUi => "Droid Sans",
+    }
+    .into()
+}

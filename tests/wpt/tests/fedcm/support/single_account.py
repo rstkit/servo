@@ -1,5 +1,5 @@
 import importlib
-error_checker = importlib.import_module("credential-management.support.fedcm.request-params-check")
+error_checker = importlib.import_module("fedcm.support.request-params-check")
 
 def main(request, response):
   request_error = error_checker.accountsCheck(request)
@@ -16,7 +16,6 @@ def main(request, response):
    "given_name": "John",
    "name": "John Doe",
    "email": "john_doe@idp.example",
-   "picture": "https://idp.example/profile/123",
    "approved_clients": ["123", "456", "789"]
   }
   ]

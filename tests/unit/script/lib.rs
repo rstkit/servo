@@ -3,19 +3,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #[cfg(test)]
-mod headers;
+mod encoding_detection;
 #[cfg(test)]
 mod htmlareaelement;
-#[cfg(test)]
-mod htmlimageelement;
 #[cfg(test)]
 mod origin;
 #[cfg(all(test, target_pointer_width = "64"))]
 mod size_of;
 #[cfg(test)]
+mod srcset;
+#[cfg(test)]
 mod textinput;
 #[cfg(test)]
 mod timeranges;
+#[cfg(test)]
+mod unminify;
 
 /**
 ```compile_fail,E0277

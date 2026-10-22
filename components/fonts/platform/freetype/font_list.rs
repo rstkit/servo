@@ -2,14 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::convert::TryInto;
-use std::ffi::CString;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::ffi::{CStr, CString};
 use std::ptr;
 
-use base::text::{UnicodeBlock, UnicodeBlockMethod};
 use fontconfig_sys::constants::{
     FC_FAMILY, FC_FILE, FC_FONTFORMAT, FC_INDEX, FC_SLANT, FC_SLANT_ITALIC, FC_SLANT_OBLIQUE,
     FC_WEIGHT, FC_WEIGHT_BOLD, FC_WEIGHT_EXTRABLACK, FC_WEIGHT_REGULAR, FC_WIDTH,
@@ -23,47 +18,26 @@ use fontconfig_sys::{
     FcObjectSetCreate, FcObjectSetDestroy, FcPattern, FcPatternAddString, FcPatternCreate,
     FcPatternDestroy, FcPatternGetInteger, FcPatternGetString, FcResultMatch, FcSetSystem,
 };
+use fonts_traits::{FontTemplate, FontTemplateDescriptor, LocalFontIdentifier};
+use icu_locale_core::subtags::language;
 use libc::{c_char, c_int};
 use log::debug;
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
-use style::values::computed::{FontStretch, FontStyle, FontWeight};
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod};
 use style::Atom;
+use style::values::computed::font::GenericFontFamily;
+use style::values::computed::{FontStyle, FontWeight, FontWidth};
 use unicode_script::Script;
 
-use super::c_str_to_string;
 use crate::font::map_platform_values_to_style_values;
-use crate::font_template::{FontTemplate, FontTemplateDescriptor};
 use crate::platform::add_noto_fallback_families;
-use crate::{EmojiPresentationPreference, FallbackFontSelectionOptions};
+use crate::{
+    EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier,
+    LowercaseFontFamilyName,
+};
 
-/// An identifier for a local font on systems using Freetype.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct LocalFontIdentifier {
-    /// The path to the font.
-    pub path: Atom,
-    /// The variation index within the font.
-    pub variation_index: i32,
-}
-
-impl LocalFontIdentifier {
-    pub(crate) fn index(&self) -> u32 {
-        self.variation_index.try_into().unwrap()
-    }
-
-    pub(crate) fn read_data_from_file(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        File::open(Path::new(&*self.path))
-            .expect("Couldn't open font file!")
-            .read_to_end(&mut bytes)
-            .unwrap();
-        bytes
-    }
-}
-
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
-    F: FnMut(String),
+    F: FnMut(&str),
 {
     unsafe {
         let config = FcConfigGetCurrent();
@@ -80,15 +54,23 @@ where
             }
 
             // Skip bitmap fonts. They aren't supported by FreeType.
-            let fontformat = c_str_to_string(format as *const c_char);
-            if fontformat != "TrueType" && fontformat != "CFF" && fontformat != "Type 1" {
+            let fontformat = CStr::from_ptr(format as *const c_char);
+            if !matches!(fontformat.to_bytes(), b"TrueType" | b"CFF" | b"Type 1") {
                 continue;
             }
 
             while FcPatternGetString(*font, FC_FAMILY.as_ptr() as *mut c_char, v, &mut family) ==
                 FcResultMatch
             {
-                let family_name = c_str_to_string(family as *const c_char);
+                let family_name = match CStr::from_ptr(family as *const c_char).to_str() {
+                    Ok(family_name) => family_name,
+                    Err(error) => {
+                        log::error!(
+                            "Ignoring font family because its name contains invalid UTF-8: {error:?}"
+                        );
+                        continue;
+                    },
+                };
                 callback(family_name);
                 v += 1;
             }
@@ -96,7 +78,7 @@ where
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
@@ -105,17 +87,32 @@ where
         let mut font_set = FcConfigGetFonts(config, FcSetSystem);
         let font_set_array_ptr = &mut font_set;
         let pattern = FcPatternCreate();
-        assert!(!pattern.is_null());
-        let family_name_cstr: CString = CString::new(family_name).unwrap();
+        debug_assert!(!pattern.is_null());
+        if pattern.is_null() {
+            log::error!("Failed to create FcPattern");
+            return;
+        }
+
+        let Ok(family_name_cstr) = CString::new(family_name) else {
+            return;
+        };
         let ok = FcPatternAddString(
             pattern,
             FC_FAMILY.as_ptr() as *mut c_char,
             family_name_cstr.as_ptr() as *const FcChar8,
         );
-        assert_ne!(ok, 0);
+        debug_assert_ne!(ok, 0);
+        if ok == 0 {
+            log::error!("Failed to create FcPattern");
+            return;
+        }
 
         let object_set = FcObjectSetCreate();
-        assert!(!object_set.is_null());
+        debug_assert!(!object_set.is_null());
+        if object_set.is_null() {
+            log::error!("Failed to create FcObjectSet");
+            return;
+        }
 
         FcObjectSetAdd(object_set, FC_FILE.as_ptr() as *mut c_char);
         FcObjectSetAdd(object_set, FC_INDEX.as_ptr() as *mut c_char);
@@ -141,22 +138,33 @@ where
             let Some(weight) = font_weight_from_fontconfig_pattern(*font) else {
                 continue;
             };
-            let Some(stretch) = font_stretch_from_fontconfig_pattern(*font) else {
+            let Some(width) = font_width_from_fontconfig_pattern(*font) else {
                 continue;
             };
             let Some(style) = font_style_from_fontconfig_pattern(*font) else {
                 continue;
             };
 
-            let local_font_identifier = LocalFontIdentifier {
-                path: Atom::from(c_str_to_string(path as *const c_char)),
-                variation_index: index as i32,
+            let path = match CStr::from_ptr(path as *const c_char).to_str() {
+                Ok(path) => path,
+                Err(error) => {
+                    log::error!(
+                        "Ignoring font variation from the {family_name:?} family because file path contains invalid UTF-8: {error:?}"
+                    );
+                    continue;
+                },
             };
-            let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
+            let local_font_identifier = LocalFontIdentifier {
+                path: Atom::from(path),
+                face_index: (index & 0xFFFF) as u16,
+                named_instance_index: (index >> 16) as u16,
+            };
+            let descriptor = FontTemplateDescriptor::new(weight, width, style);
 
-            callback(FontTemplate::new_for_local_font(
-                local_font_identifier,
+            callback(FontTemplate::new(
+                FontIdentifier::Local(local_font_identifier),
                 descriptor,
+                None,
             ))
         }
 
@@ -166,41 +174,6 @@ where
     }
 }
 
-pub fn system_default_family(generic_name: &str) -> Option<String> {
-    let generic_name_c = CString::new(generic_name).unwrap();
-    let generic_name_ptr = generic_name_c.as_ptr();
-
-    unsafe {
-        let pattern = FcNameParse(generic_name_ptr as *mut FcChar8);
-
-        FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
-        FcDefaultSubstitute(pattern);
-
-        let mut result = 0;
-        let family_match = FcFontMatch(ptr::null_mut(), pattern, &mut result);
-
-        let family_name = if result == FcResultMatch {
-            let mut match_string: *mut FcChar8 = ptr::null_mut();
-            FcPatternGetString(
-                family_match,
-                FC_FAMILY.as_ptr() as *mut c_char,
-                0,
-                &mut match_string,
-            );
-            let result = c_str_to_string(match_string as *const c_char);
-            FcPatternDestroy(family_match);
-            Some(result)
-        } else {
-            None
-        };
-
-        FcPatternDestroy(pattern);
-        family_name
-    }
-}
-
-pub static SANS_SERIF_FONT_FAMILY: &str = "DejaVu Sans";
-
 // Based on gfxPlatformGtk::GetCommonFallbackFonts() in Gecko
 pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'static str> {
     let mut families = Vec::new();
@@ -208,17 +181,23 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
         families.push("Noto Color Emoji");
     }
 
-    add_noto_fallback_families(options, &mut families);
-
-    if matches!(
-        Script::from(options.character),
-        Script::Bopomofo | Script::Han
-    ) {
-        families.push("WenQuanYi Micro Hei");
-    }
+    add_noto_fallback_families(options.clone(), &mut families);
 
     if let Some(block) = options.character.block() {
         match block {
+            // In Japanese typography, it is not common to use different fonts
+            // for Kanji(Han), Hiragana, and Katakana within the same document.
+            // We uniformly fallback to Japanese fonts when the document language is Japanese.
+            _ if options.language == language!("ja") => {
+                families.push("TakaoPGothic");
+            },
+            _ if matches!(
+                Script::from(options.character),
+                Script::Bopomofo | Script::Han
+            ) && options.language != language!("ja") =>
+            {
+                families.push("WenQuanYi Micro Hei");
+            },
             UnicodeBlock::HalfwidthandFullwidthForms |
             UnicodeBlock::EnclosedIdeographicSupplement => families.push("WenQuanYi Micro Hei"),
             UnicodeBlock::Hiragana |
@@ -241,6 +220,61 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
+    let generic_string = match generic {
+        GenericFontFamily::None | GenericFontFamily::Serif => c"serif",
+        GenericFontFamily::SansSerif => c"sans-serif",
+        GenericFontFamily::Monospace => c"monospace",
+        GenericFontFamily::Cursive => c"cursive",
+        GenericFontFamily::Fantasy => c"fantasy",
+        GenericFontFamily::SystemUi => c"sans-serif",
+    };
+
+    let generic_name_ptr = generic_string.as_ptr();
+    unsafe {
+        let pattern = FcNameParse(generic_name_ptr as *mut FcChar8);
+        FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
+        FcDefaultSubstitute(pattern);
+
+        let mut result = 0;
+        let family_match = FcFontMatch(ptr::null_mut(), pattern, &mut result);
+
+        if result == FcResultMatch {
+            let mut match_string: *mut FcChar8 = ptr::null_mut();
+            FcPatternGetString(
+                family_match,
+                FC_FAMILY.as_ptr() as *mut c_char,
+                0,
+                &mut match_string,
+            );
+            let family_name = CStr::from_ptr(match_string as *const c_char)
+                .to_str()
+                .expect("Font family name contains invalid UTF-8")
+                .to_owned();
+
+            FcPatternDestroy(family_match);
+            FcPatternDestroy(pattern);
+
+            return family_name.into();
+        }
+
+        FcPatternDestroy(family_match);
+        FcPatternDestroy(pattern);
+    }
+
+    match generic {
+        GenericFontFamily::None | GenericFontFamily::Serif => "Noto Serif",
+        GenericFontFamily::SansSerif => "Noto Sans",
+        GenericFontFamily::Monospace => "Deja Vu Sans Mono",
+        GenericFontFamily::Cursive => "Comic Sans MS",
+        GenericFontFamily::Fantasy => "Impact",
+        GenericFontFamily::SystemUi => "Noto Sans",
+    }
+    .into()
+}
+
 fn font_style_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontStyle> {
     let mut slant: c_int = 0;
     unsafe {
@@ -255,7 +289,7 @@ fn font_style_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontSty
     })
 }
 
-fn font_stretch_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontStretch> {
+fn font_width_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontWidth> {
     let mut width: c_int = 0;
     unsafe {
         if FcResultMatch != FcPatternGetInteger(pattern, FC_WIDTH.as_ptr(), 0, &mut width) {
@@ -275,7 +309,7 @@ fn font_stretch_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontS
     ];
 
     let mapped_width = map_platform_values_to_style_values(&mapping, width as f64);
-    Some(FontStretch::from_percentage(mapped_width as f32))
+    Some(FontWidth::from_percentage(mapped_width as f32))
 }
 
 fn font_weight_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontWeight> {

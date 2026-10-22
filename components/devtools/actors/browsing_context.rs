@@ -6,30 +6,38 @@
 //! Connection point for remote devtools that wish to investigate a particular Browsing Context's contents.
 //! Supports dynamic attaching and detaching which control notifications of navigation, etc.
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use base::id::{BrowsingContextId, PipelineId};
-use devtools_traits::DevtoolScriptControlMsg::{self, WantsLiveNotifications};
-use devtools_traits::{DevtoolsPageInfo, NavigationState};
-use ipc_channel::ipc::IpcSender;
+use atomic_refcell::AtomicRefCell;
+use devtools_traits::DevtoolScriptControlMsg::{self, GetCssDatabase, SimulateColorScheme};
+use devtools_traits::DevtoolsPageInfo;
+use embedder_traits::Theme;
+use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_base::generic_channel::{self, GenericSender, SendError};
+use servo_base::id::PipelineId;
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::actors::configuration::{TargetConfigurationActor, ThreadConfigurationActor};
-use crate::actors::emulation::EmulationActor;
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
 use crate::actors::inspector::InspectorActor;
-use crate::actors::performance::PerformanceActor;
-use crate::actors::profiler::ProfilerActor;
+use crate::actors::inspector::accessibility::AccessibilityActor;
+use crate::actors::inspector::css_properties::CssPropertiesActor;
+use crate::actors::reflow::ReflowActor;
 use crate::actors::stylesheets::StyleSheetsActor;
 use crate::actors::tab::TabDescriptorActor;
 use crate::actors::thread::ThreadActor;
-use crate::actors::timeline::TimelineActor;
 use crate::actors::watcher::{SessionContext, SessionContextType, WatcherActor};
-use crate::protocol::JsonPacketStream;
-use crate::StreamId;
+use crate::id::{DevtoolsBrowserId, DevtoolsBrowsingContextId, DevtoolsOuterWindowId};
+use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::resource::ResourceAvailable;
+use crate::{EmptyReplyMsg, StreamId};
+
+#[derive(Serialize)]
+struct ListWorkersReply {
+    from: String,
+    workers: Vec<()>,
+}
 
 #[derive(Serialize)]
 struct FrameUpdateReply {
@@ -49,315 +57,312 @@ struct FrameUpdateMsg {
 }
 
 #[derive(Serialize)]
-struct ResourceAvailableReply {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    resources: Vec<ResourceAvailableMsg>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResourceAvailableMsg {
-    #[serde(rename = "hasNativeConsoleAPI")]
-    has_native_console_api: Option<bool>,
-    name: String,
-    #[serde(rename = "newURI")]
-    new_uri: Option<String>,
-    resource_type: String,
-    time: u64,
-    title: Option<String>,
-    url: Option<String>,
-}
-
-#[derive(Serialize)]
-struct TabNavigated {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    url: String,
-    title: Option<String>,
-    #[serde(rename = "nativeConsoleAPI")]
-    native_console_api: bool,
-    state: String,
-    is_frame_switching: bool,
-}
-
-#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowsingContextTraits {
+    frames: bool,
     is_browsing_context: bool,
+    log_in_page: bool,
+    navigation: bool,
+    supports_top_level_target_flag: bool,
+    watchpoints: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TargetType {
+    Frame,
+    // Other target types not implemented yet.
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BrowsingContextActorMsg {
+pub(crate) struct BrowsingContextActorMsg {
     actor: String,
     title: String,
     url: String,
+    /// This correspond to webview_id
+    #[serde(rename = "browserId")]
+    browser_id: u32,
     #[serde(rename = "outerWindowID")]
     outer_window_id: u32,
     #[serde(rename = "browsingContextID")]
     browsing_context_id: u32,
     is_top_level_target: bool,
-    console_actor: String,
-    thread_actor: String,
     traits: BrowsingContextTraits,
+    // Implemented actors
+    accessibility_actor: String,
+    console_actor: String,
+    css_properties_actor: String,
+    inspector_actor: String,
+    reflow_actor: String,
+    style_sheets_actor: String,
+    thread_actor: String,
+    target_type: TargetType,
     // Part of the official protocol, but not yet implemented.
-    // emulation_actor: String,
-    // inspector_actor: String,
-    // timeline_actor: String,
-    // profiler_actor: String,
-    // performance_actor: String,
-    // style_sheets_actor: String,
-    // storage_actor: String,
-    // memory_actor: String,
-    // framerate_actor: String,
-    // reflow_actor: String,
-    // css_properties_actor: String,
     // animations_actor: String,
-    // web_extension_inspected_window_actor: String,
-    // accessibility_actor: String,
-    // screenshot_actor: String,
     // changes_actor: String,
-    // web_socket_actor: String,
+    // framerate_actor: String,
     // manifest_actor: String,
+    // memory_actor: String,
+    // network_content_actor: String,
+    // objects_manager: String,
+    // performance_actor: String,
+    // resonsive_actor: String,
+    // storage_actor: String,
+    // tracer_actor: String,
+    // web_extension_inspected_window_actor: String,
+    // web_socket_actor: String,
 }
 
 /// The browsing context actor encompasses all of the other supporting actors when debugging a web
 /// view. To this extent, it contains a watcher actor that helps when communicating with the host,
 /// as well as resource actors that each perform one debugging function.
+#[derive(MallocSizeOf)]
 pub(crate) struct BrowsingContextActor {
-    pub name: String,
-    pub title: RefCell<String>,
-    pub url: RefCell<String>,
-    pub active_pipeline: Cell<PipelineId>,
-    pub browsing_context_id: BrowsingContextId,
-    pub console: String,
-    pub _emulation: String,
-    pub _inspector: String,
-    pub _performance: String,
-    pub _profiler: String,
-    pub _style_sheets: String,
-    pub target_configuration: String,
-    pub thread_configuration: String,
-    pub thread: String,
-    pub _timeline: String,
-    pub _tab: String,
-    pub script_chan: IpcSender<DevtoolScriptControlMsg>,
-    pub streams: RefCell<HashMap<StreamId, TcpStream>>,
-    pub watcher: String,
+    name: String,
+    /// This corresponds to webview_id
+    pub browser_id: DevtoolsBrowserId,
+    // TODO: Should these ids be atomic?
+    active_pipeline_id: AtomicRefCell<PipelineId>,
+    active_outer_window_id: AtomicRefCell<DevtoolsOuterWindowId>,
+    pub browsing_context_id: DevtoolsBrowsingContextId,
+    accessibility_name: String,
+    pub console_name: String,
+    css_properties_name: String,
+    pub inspector_name: String,
+    pub page_info: AtomicRefCell<DevtoolsPageInfo>,
+    reflow_name: String,
+    pub style_sheets_name: String,
+    pub thread_name: String,
+    // Different pipelines may run on different script threads.
+    // These should be kept around even when the active pipeline is updated,
+    // in case the browsing context revisits a pipeline via history navigation.
+    // TODO: Each entry is stored forever; ideally there should be a way to
+    //       detect when `ScriptThread`s are destroyed and remove the associated
+    //       entries.
+    script_chans: AtomicRefCell<FxHashMap<PipelineId, GenericSender<DevtoolScriptControlMsg>>>,
+    pub watcher_name: String,
+}
+
+impl ResourceAvailable for BrowsingContextActor {
+    fn actor_name(&self) -> String {
+        self.name.clone()
+    }
 }
 
 impl Actor for BrowsingContextActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        _stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
-            _ => ActorMessageStatus::Ignored,
-        })
-    }
-
-    fn cleanup(&self, id: StreamId) {
-        self.streams.borrow_mut().remove(&id);
-        if self.streams.borrow().is_empty() {
-            self.script_chan
-                .send(WantsLiveNotifications(self.active_pipeline.get(), false))
-                .unwrap();
-        }
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "listFrames" => {
+                // TODO: Find out what needs to be listed here
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
+            },
+            "listWorkers" => {
+                request.reply_final(&ListWorkersReply {
+                    from: self.name().into(),
+                    // TODO: Find out what needs to be listed here
+                    workers: vec![],
+                })?
+            },
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl BrowsingContextActor {
-    pub(crate) fn new(
-        console: String,
-        id: BrowsingContextId,
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn register(
+        registry: &ActorRegistry,
+        console_name: String,
+        browser_id: DevtoolsBrowserId,
+        browsing_context_id: DevtoolsBrowsingContextId,
         page_info: DevtoolsPageInfo,
-        pipeline: PipelineId,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
-        actors: &mut ActorRegistry,
-    ) -> BrowsingContextActor {
-        let name = actors.new_name("target");
-        let DevtoolsPageInfo { title, url } = page_info;
+        pipeline_id: PipelineId,
+        outer_window_id: DevtoolsOuterWindowId,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
+    ) -> Arc<Self> {
+        let name = new_actor_name::<BrowsingContextActor>();
 
-        let emulation = EmulationActor::new(actors.new_name("emulation"));
+        let accessibility_actor = AccessibilityActor::register(registry);
 
-        let inspector = InspectorActor {
-            name: actors.new_name("inspector"),
-            walker: RefCell::new(None),
-            pageStyle: RefCell::new(None),
-            highlighter: RefCell::new(None),
-            script_chan: script_sender.clone(),
-            browsing_context: name.clone(),
-        };
+        let properties = (|| {
+            let (properties_sender, properties_receiver) = generic_channel::channel()?;
+            script_sender.send(GetCssDatabase(properties_sender)).ok()?;
+            properties_receiver.recv().ok()
+        })()
+        .unwrap_or_default();
 
-        let performance = PerformanceActor::new(actors.new_name("performance"));
+        let css_properties_actor = CssPropertiesActor::register(registry, properties);
 
-        let profiler = ProfilerActor::new(actors.new_name("profiler"));
+        let inspector_actor = InspectorActor::register(registry, name.clone());
 
-        // the strange switch between styleSheets and stylesheets is due
-        // to an inconsistency in devtools. See Bug #1498893 in bugzilla
-        let style_sheets = StyleSheetsActor::new(actors.new_name("stylesheets"));
+        let reflow_actor = ReflowActor::register(registry);
 
-        let tabdesc = TabDescriptorActor::new(actors, name.clone());
+        let style_sheets_actor =
+            StyleSheetsActor::register(registry, script_sender.clone(), name.clone());
 
-        let target_configuration =
-            TargetConfigurationActor::new(actors.new_name("target-configuration"));
+        let _ = TabDescriptorActor::register(registry, name.clone());
 
-        let thread_configuration =
-            ThreadConfigurationActor::new(actors.new_name("thread-configuration"));
+        let thread_actor =
+            ThreadActor::register(registry, script_sender.clone(), Some(name.clone()));
 
-        let thread = ThreadActor::new(actors.new_name("context"));
-
-        let timeline =
-            TimelineActor::new(actors.new_name("timeline"), pipeline, script_sender.clone());
-
-        let watcher = WatcherActor::new(
-            actors.new_name("watcher"),
+        let watcher_actor = WatcherActor::register(
+            registry,
             name.clone(),
             SessionContext::new(SessionContextType::BrowserElement),
         );
 
-        let target = BrowsingContextActor {
+        let mut script_chans = FxHashMap::default();
+        script_chans.insert(pipeline_id, script_sender);
+
+        let actor = BrowsingContextActor {
             name,
-            script_chan: script_sender,
-            title: RefCell::new(title),
-            url: RefCell::new(url.into_string()),
-            active_pipeline: Cell::new(pipeline),
-            browsing_context_id: id,
-            console,
-            _emulation: emulation.name(),
-            _inspector: inspector.name(),
-            _performance: performance.name(),
-            _profiler: profiler.name(),
-            streams: RefCell::new(HashMap::new()),
-            _style_sheets: style_sheets.name(),
-            _tab: tabdesc.name(),
-            target_configuration: target_configuration.name(),
-            thread_configuration: thread_configuration.name(),
-            thread: thread.name(),
-            _timeline: timeline.name(),
-            watcher: watcher.name(),
+            script_chans: script_chans.into(),
+            active_pipeline_id: pipeline_id.into(),
+            active_outer_window_id: outer_window_id.into(),
+            browser_id,
+            browsing_context_id,
+            accessibility_name: accessibility_actor.name().into(),
+            console_name,
+            css_properties_name: css_properties_actor.name().into(),
+            inspector_name: inspector_actor.name().into(),
+            page_info: page_info.into(),
+            reflow_name: reflow_actor.name().into(),
+            style_sheets_name: style_sheets_actor.name().into(),
+            thread_name: thread_actor.name().into(),
+            watcher_name: watcher_actor.name().into(),
         };
 
-        actors.register(Box::new(emulation));
-        actors.register(Box::new(inspector));
-        actors.register(Box::new(performance));
-        actors.register(Box::new(profiler));
-        actors.register(Box::new(style_sheets));
-        actors.register(Box::new(tabdesc));
-        actors.register(Box::new(target_configuration));
-        actors.register(Box::new(thread_configuration));
-        actors.register(Box::new(thread));
-        actors.register(Box::new(timeline));
-        actors.register(Box::new(watcher));
-
-        target
+        registry.register::<Self>(actor)
     }
 
-    pub fn encodable(&self) -> BrowsingContextActorMsg {
-        BrowsingContextActorMsg {
-            actor: self.name(),
-            traits: BrowsingContextTraits {
-                is_browsing_context: true,
-            },
-            title: self.title.borrow().clone(),
-            url: self.url.borrow().clone(),
-            //FIXME: shouldn't ignore pipeline namespace field
-            browsing_context_id: self.browsing_context_id.index.0.get(),
-            //FIXME: shouldn't ignore pipeline namespace field
-            outer_window_id: self.active_pipeline.get().index.0.get(),
-            is_top_level_target: true,
-            console_actor: self.console.clone(),
-            thread_actor: self.thread.clone(),
-            // emulation_actor: self.emulation.clone(),
-            // inspector_actor: self.inspector.clone(),
-            // performance_actor: self.performance.clone(),
-            // profiler_actor: self.profiler.clone(),
-            // style_sheets_actor: self.style_sheets.clone(),
-            // timeline_actor: self.timeline.clone(),
-        }
+    pub(crate) fn handle_new_global(
+        &self,
+        pipeline: PipelineId,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
+    ) {
+        self.script_chans
+            .borrow_mut()
+            .insert(pipeline, script_sender);
     }
 
-    pub(crate) fn navigate(&self, state: NavigationState) {
-        let (pipeline, title, url, state) = match state {
-            NavigationState::Start(url) => (None, None, url, "start"),
-            NavigationState::Stop(pipeline, info) => {
-                (Some(pipeline), Some(info.title), info.url, "stop")
-            },
-        };
-        if let Some(p) = pipeline {
-            self.active_pipeline.set(p);
-        }
-        url.as_str().clone_into(&mut self.url.borrow_mut());
-        if let Some(ref t) = title {
-            self.title.borrow_mut().clone_from(t);
-        }
-
-        let msg = TabNavigated {
-            from: self.name(),
-            type_: "tabNavigated".to_owned(),
-            url: url.as_str().to_owned(),
-            title,
-            native_console_api: true,
-            state: state.to_owned(),
-            is_frame_switching: false,
-        };
-
-        for stream in self.streams.borrow_mut().values_mut() {
-            let _ = stream.write_json_packet(&msg);
-        }
-    }
-
-    pub(crate) fn title_changed(&self, pipeline: PipelineId, title: String) {
-        if pipeline != self.active_pipeline.get() {
+    pub(crate) fn title_changed(&self, pipeline_id: PipelineId, title: String) {
+        if pipeline_id != self.pipeline_id() {
             return;
         }
-        *self.title.borrow_mut() = title;
+        self.page_info.borrow_mut().title = title;
     }
 
-    pub(crate) fn frame_update(&self, stream: &mut TcpStream) {
-        let _ = stream.write_json_packet(&FrameUpdateReply {
-            from: self.name(),
+    pub(crate) fn frame_update(&self, request: &mut ClientRequest) {
+        let _ = request.write_json_packet(&FrameUpdateReply {
+            from: self.name().into(),
             type_: "frameUpdate".into(),
             frames: vec![FrameUpdateMsg {
-                id: self.browsing_context_id.index.0.get(),
+                id: self.browsing_context_id.value(),
                 is_top_level: true,
-                title: self.title.borrow().clone(),
-                url: self.url.borrow().clone(),
+                title: self.title(),
+                url: self.url(),
             }],
         });
     }
 
-    pub(crate) fn document_event(&self, stream: &mut TcpStream) {
-        // TODO: This is a hacky way of sending the 3 messages
-        //       Figure out if there needs work to be done here, ensure the page is loaded
-        for (i, &name) in ["dom-loading", "dom-interactive", "dom-complete"]
-            .iter()
-            .enumerate()
-        {
-            let _ = stream.write_json_packet(&ResourceAvailableReply {
-                from: self.name(),
-                type_: "resource-available-form".into(),
-                resources: vec![ResourceAvailableMsg {
-                    has_native_console_api: None,
-                    name: name.into(),
-                    new_uri: None,
-                    resource_type: "document-event".into(),
-                    time: i as u64,
-                    title: Some(self.title.borrow().clone()),
-                    url: Some(self.url.borrow().clone()),
-                }],
-            });
+    pub fn simulate_color_scheme(&self, theme: Option<Theme>) -> Result<(), ()> {
+        self.script_chan()
+            .send(SimulateColorScheme(self.pipeline_id(), theme))
+            .map_err(|_| ())
+    }
+
+    pub(crate) fn pipeline_id(&self) -> PipelineId {
+        *self.active_pipeline_id.borrow()
+    }
+
+    pub(crate) fn title(&self) -> String {
+        self.page_info.borrow().title.clone()
+    }
+
+    pub(crate) fn url(&self) -> String {
+        self.page_info.borrow().url.clone().into_string()
+    }
+
+    pub(crate) fn update_pipeline(
+        &self,
+        pipeline_id: PipelineId,
+        outer_window_id: DevtoolsOuterWindowId,
+        page_info: DevtoolsPageInfo,
+    ) {
+        *self.active_pipeline_id.borrow_mut() = pipeline_id;
+        *self.active_outer_window_id.borrow_mut() = outer_window_id;
+        *self.page_info.borrow_mut() = page_info;
+    }
+
+    pub(crate) fn outer_window_id(&self) -> DevtoolsOuterWindowId {
+        *self.active_outer_window_id.borrow()
+    }
+
+    /// Returns the script sender for the active pipeline.
+    pub(crate) fn script_chan(&self) -> GenericSender<DevtoolScriptControlMsg> {
+        self.script_chans
+            .borrow()
+            .get(&self.pipeline_id())
+            .unwrap()
+            .clone()
+    }
+
+    pub(crate) fn instruct_script_to_send_live_updates(&self, should_send_updates: bool) {
+        let result = self
+            .script_chan()
+            .send(DevtoolScriptControlMsg::WantsLiveNotifications(
+                self.pipeline_id(),
+                should_send_updates,
+            ));
+
+        // Notifying the script thread may fail with a "Disconnected" error if servo
+        // as a whole is being shut down.
+        debug_assert!(matches!(result, Ok(_) | Err(SendError::Disconnected)));
+    }
+}
+
+impl ActorEncode<BrowsingContextActorMsg> for BrowsingContextActor {
+    fn encode(&self, _: &ActorRegistry) -> BrowsingContextActorMsg {
+        BrowsingContextActorMsg {
+            actor: self.name().into(),
+            traits: BrowsingContextTraits {
+                is_browsing_context: true,
+                frames: true,
+                log_in_page: false,
+                navigation: true,
+                supports_top_level_target_flag: true,
+                watchpoints: true,
+            },
+            title: self.title(),
+            url: self.url(),
+            browser_id: self.browser_id.value(),
+            browsing_context_id: self.browsing_context_id.value(),
+            outer_window_id: self.outer_window_id().value(),
+            is_top_level_target: true,
+            accessibility_actor: self.accessibility_name.clone(),
+            console_actor: self.console_name.clone(),
+            css_properties_actor: self.css_properties_name.clone(),
+            inspector_actor: self.inspector_name.clone(),
+            reflow_actor: self.reflow_name.clone(),
+            style_sheets_actor: self.style_sheets_name.clone(),
+            thread_actor: self.thread_name.clone(),
+            target_type: TargetType::Frame,
         }
     }
 }

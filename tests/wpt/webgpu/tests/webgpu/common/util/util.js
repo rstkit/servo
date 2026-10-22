@@ -1,7 +1,6 @@
 /**
 * AUTO-GENERATED - DO NOT EDIT. Source: https://github.com/gpuweb/cts
 **/import { Float16Array } from '../../external/petamoriken/float16/float16.js';import { SkipTestCase } from '../framework/fixture.js';import { globalTestConfig } from '../framework/test_config.js';
-import { Logger } from '../internal/logging/logger.js';
 
 import { keysOf } from './data_tables.js';
 import { timeout } from './timeout.js';
@@ -24,7 +23,7 @@ export class ErrorWithExtra extends Error {
     super(message);
 
     const oldExtras = baseOrMessage instanceof ErrorWithExtra ? baseOrMessage.extra : {};
-    this.extra = Logger.globalDebugMode ?
+    this.extra = globalTestConfig.enableDebugLogs ?
     { ...oldExtras, ...newExtra() } :
     { omitted: 'pass ?debug=1' };
   }
@@ -58,19 +57,20 @@ expectedName,
 p,
 { allowMissingStack = false, message } = {})
 {
-  try {
-    await p;
-    unreachable(message);
-  } catch (ex) {
-    // Asserted as expected
-    if (!allowMissingStack) {
-      const m = message ? ` (${message})` : '';
-      assert(
-        ex instanceof Error && typeof ex.stack === 'string',
-        'threw as expected, but missing stack' + m
-      );
+  await p.then(
+    () => {
+      unreachable(message);
+    },
+    (ex) => {
+      assert(ex instanceof Error, 'rejected with a non-Error object');
+      assert(ex.name === expectedName, `rejected with name ${ex.name} instead of ${expectedName}`);
+      // Asserted as expected
+      if (!allowMissingStack) {
+        const m = message ? ` (${message})` : '';
+        assert(typeof ex.stack === 'string', 'threw as expected, but missing stack' + m);
+      }
     }
-  }
+  );
 }
 
 /**
@@ -91,6 +91,7 @@ export function skipTestCase(msg) {
  * The `performance` interface.
  * It is available in all browsers, but it is not in scope by default in Node.
  */
+
 const perf = typeof performance !== 'undefined' ? performance : require('perf_hooks').performance;
 
 /**
@@ -258,6 +259,15 @@ export function mapLazy(xs, f) {
   };
 }
 
+/** Count the number of elements `x` for which `predicate(x)` is true. */
+export function count(xs, predicate) {
+  let count = 0;
+  for (const x of xs) {
+    if (predicate(x)) count++;
+  }
+  return count;
+}
+
 const ReorderOrders = {
   forward: true,
   backward: true,
@@ -293,6 +303,16 @@ export function reorder(order, arr) {
   }
 }
 
+/**
+ * A typed version of Object.entries
+ */
+
+export function typedEntries(obj) {
+  // The cast is done once, inside the helper function,
+  // keeping the call site clean and type-safe.
+  return Object.entries(obj);
+}
+
 const TypedArrayBufferViewInstances = [
 new Uint8Array(),
 new Uint8ClampedArray(),
@@ -304,7 +324,8 @@ new Int32Array(),
 new Float16Array(),
 new Float32Array(),
 new Float64Array(),
-new BigInt64Array()];
+new BigInt64Array(),
+new BigUint64Array()];
 
 
 
@@ -474,4 +495,46 @@ export function filterUniqueValueTestVariants(valueTestVariants) {
  */
 export function makeValueTestVariant(base, variant) {
   return base * variant.mult + variant.add;
+}
+
+/**
+ * Use instead of features.has because feature's has takes any string
+ * and we want to prevent typos.
+ */
+export function hasFeature(features, feature) {
+
+  return features.has(feature);
+}
+
+/** Convenience helper for combinations of 1-2 usage bits from a list of usage bits. */
+export function combinationsOfOneOrTwoUsages(usages) {
+  const combinations = [];
+  for (const usage0 of usages) {
+    for (const usage1 of usages) {
+      if (usage0 <= usage1) {
+        combinations.push(usage0 | usage1);
+      }
+    }
+  }
+  return combinations;
+}
+
+/**
+ * Checks if the browser supports immediate data (experimental).
+ *
+ * Checks for:
+ * - `setImmediates` method on `GPURenderPassEncoder`, `GPUComputePassEncoder`, or `GPURenderBundleEncoder` prototypes.
+ * - `maxImmediateSize` property on `GPUSupportedLimits` prototype.
+ * - `immediate_address_space` feature in `gpu.wgslLanguageFeatures`.
+ *
+ * This helper is used to skip tests when the environment does not support immediate data functionality.
+ */
+export function supportsImmediateData(gpu) {
+  return (
+    'setImmediates' in GPURenderPassEncoder.prototype ||
+    'setImmediates' in GPUComputePassEncoder.prototype ||
+    'setImmediates' in GPURenderBundleEncoder.prototype ||
+    'maxImmediateSize' in GPUSupportedLimits.prototype ||
+    gpu.wgslLanguageFeatures.has('immediate_address_space'));
+
 }

@@ -10,7 +10,9 @@ use style::context::QuirksMode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::media_queries::MediaList;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::{AllowImportRules, Origin, Stylesheet, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, Origin, Stylesheet, StylesheetInDocument, UrlExtraData,
+};
 use url::Url;
 
 #[derive(Debug)]
@@ -113,28 +115,28 @@ fn test_report_error_stylesheet() {
     error_reporter.assert_messages_contain(&[
         (
             3,
-            18,
+            9,
             "Unsupported property declaration: 'display: invalid;'",
         ),
-        (
-            4,
-            43,
-            "Unsupported property declaration: 'background-image:",
-        ), // FIXME: column should be around 56
-        (5, 17, "Unsupported property declaration: 'invalid: true;'"),
-        (7, 28, "Invalid media rule"),
+        (4, 9, "Unsupported property declaration: 'background-image:"), // FIXME: column should be around 56
+        (5, 9, "Unsupported property declaration: 'invalid'"),
+        (7, 12, "Invalid media rule"),
         // When @counter-style is supported, this should be replaced with two errors
-        (9, 19, "Invalid rule: '@counter-style "),
-        // When @font-feature-values is supported, this should be replaced with two errors
-        (10, 25, "Invalid rule: '@font-feature-values "),
-        (11, 13, "Invalid rule: '@invalid'"),
-        (12, 29, "Invalid rule: '@invalid'"),
-        (13, 34, "Invalid rule: '@supports "),
-        (14, 26, "Invalid keyframe rule: 'from invalid '"),
+        (9, 5, "Invalid rule: '@counter-style "),
+        (10, 38, "Unsupported rule: '@foo ', @ rule invalid"),
+        (
+            10,
+            55,
+            "Unsupported property declaration: 'foo: 1 invalid 2 ', found unexpected token",
+        ),
+        (11, 5, "Invalid rule: '@invalid'"),
+        (12, 21, "Invalid rule: '@invalid'"),
+        (13, 5, "Invalid rule: '@supports "),
+        (14, 22, "Invalid keyframe rule: 'from invalid '"),
         (
             14,
-            52,
-            "Unsupported keyframe property declaration: 'margin: 0 invalid 0;'",
+            43,
+            "Unsupported property declaration: 'margin: 0 invalid 0;'",
         ),
     ]);
 
@@ -169,8 +171,8 @@ fn test_no_report_unrecognized_vendor_properties() {
 
     error_reporter.assert_messages_contain(&[(
         4,
-        31,
-        "Unsupported property declaration: '-moz-background-color: red;'",
+        9,
+        "Unsupported property declaration: '-moz-background-color'",
     )]);
 }
 
@@ -193,14 +195,15 @@ fn test_source_map_url() {
             url.into(),
             Origin::UserAgent,
             media,
-            lock,
+            lock.clone(),
             None,
             None,
             QuirksMode::NoQuirks,
             AllowImportRules::Yes,
         );
-        let url_opt = stylesheet.contents.source_map_url.read();
-        assert_eq!(*url_opt, test.1);
+        let guard = lock.read();
+        let url_opt = stylesheet.contents(&guard).source_map_url.clone();
+        assert_eq!(url_opt, test.1);
     }
 }
 
@@ -220,13 +223,14 @@ fn test_source_url() {
             url.into(),
             Origin::UserAgent,
             media,
-            lock,
+            lock.clone(),
             None,
             None,
             QuirksMode::NoQuirks,
             AllowImportRules::Yes,
         );
-        let url_opt = stylesheet.contents.source_url.read();
-        assert_eq!(*url_opt, test.1);
+        let guard = lock.read();
+        let url_opt = stylesheet.contents(&guard).source_url.clone();
+        assert_eq!(url_opt, test.1);
     }
 }

@@ -9,22 +9,85 @@
 //! You should almost never need to add a data type to this crate. Instead look for
 //! a more shared crate that has fewer dependents.
 
+pub mod cross_process_instant;
 pub mod generic_channel;
+#[macro_use]
 pub mod id;
 pub mod print_tree;
+mod rope;
 pub mod text;
+pub mod threadboost;
+pub mod threadpool;
 mod unicode_block;
 
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+
+use log::{trace, warn};
+use malloc_size_of_derive::MallocSizeOf;
+pub use rope::{Rope, RopeChars, RopeIndex, RopeMovement, RopeSlice};
 use serde::{Deserialize, Serialize};
 use webrender_api::Epoch as WebRenderEpoch;
 
+pub fn read_json_from_file<T>(data: &mut T, config_dir: &Path, filename: &str)
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let path = config_dir.join(filename);
+    let display = path.display();
+
+    let file = match File::open(&path) {
+        Err(why) => {
+            warn!("couldn't open {}: {}", display, why);
+            return;
+        },
+        Ok(file) => file,
+    };
+    let buf_reader = BufReader::new(file);
+
+    match serde_json::from_reader(buf_reader) {
+        Ok(decoded_buffer) => *data = decoded_buffer,
+        Err(why) => warn!("Could not deserialize file {}", why),
+    }
+}
+
+pub fn write_json_to_file<T>(data: &T, config_dir: &Path, filename: &str)
+where
+    T: Serialize,
+{
+    let path = config_dir.join(filename);
+    let display = path.display();
+
+    let mut file = match File::create(&path) {
+        Err(why) => panic!("couldn't create {}: {}", display, why),
+        Ok(file) => file,
+    };
+    let mut writer = BufWriter::new(&mut file);
+    serde_json::to_writer_pretty(&mut writer, data).expect("Could not serialize to file");
+    trace!("successfully wrote to {display}");
+}
+
 /// A struct for denoting the age of messages; prevents race conditions.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    MallocSizeOf,
+)]
 pub struct Epoch(pub u32);
 
 impl Epoch {
-    pub fn next(&mut self) {
-        self.0 += 1;
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
     }
 }
 

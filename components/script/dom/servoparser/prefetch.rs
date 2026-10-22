@@ -2,61 +2,87 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use base::id::PipelineId;
+use std::cell::{Cell, RefCell};
+use std::ops::Deref;
+
 use html5ever::buffer_queue::BufferQueue;
 use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{
-    Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer as HtmlTokenizer, TokenizerResult,
+    Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer as HtmlTokenizer,
 };
-use html5ever::{local_name, Attribute, LocalName};
+use html5ever::{Attribute, LocalName, local_name};
 use js::jsapi::JSTracer;
-use net_traits::request::{CorsSettings, CredentialsMode, ParserMetadata, Referrer};
-use net_traits::{CoreResourceMsg, FetchChannels, IpcSend, ReferrerPolicy, ResourceThreads};
-use servo_url::{ImmutableOrigin, ServoUrl};
+use markup5ever::TokenizerResult;
+use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::request::{
+    CorsSettings, CredentialsMode, Destination, ParserMetadata, Referrer, RequestClient,
+};
+use net_traits::{CoreResourceMsg, FetchChannels, ReferrerPolicy, ResourceThreads};
+use servo_base::generic_channel::GenericSend;
+use servo_base::id::{PipelineId, WebViewId};
+use servo_url::ServoUrl;
 
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};
-use crate::dom::document::{determine_policy_for_token, Document};
-use crate::dom::htmlimageelement::{image_fetch_request, FromPictureOrSrcSet};
-use crate::dom::htmlscriptelement::script_fetch_request;
-use crate::script_module::ScriptFetchOptions;
-use crate::stylesheet_loader::stylesheet_fetch_request;
+use crate::dom::document::Document;
+use crate::dom::html::htmlscriptelement::script_fetch_request;
+use crate::dom::processingoptions::determine_cors_settings_for_token;
+use crate::fetch::fetch::create_a_potential_cors_request;
+use crate::scripting::fetching_options::ScriptFetchOptions;
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
-pub struct Tokenizer {
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct Tokenizer {
     #[ignore_malloc_size_of = "Defined in html5ever"]
-    inner: HtmlTokenizer<PrefetchSink>,
+    inner: TraceableTokenizer,
 }
 
-#[allow(unsafe_code)]
-unsafe impl CustomTraceable for HtmlTokenizer<PrefetchSink> {
+struct TraceableTokenizer(HtmlTokenizer<PrefetchSink>);
+
+impl Deref for TraceableTokenizer {
+    type Target = HtmlTokenizer<PrefetchSink>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[expect(unsafe_code)]
+unsafe impl JSTraceable for TraceableTokenizer {
     unsafe fn trace(&self, trc: *mut JSTracer) {
-        self.sink.trace(trc)
+        unsafe { CustomTraceable::trace(&self.0, trc) }
+    }
+}
+
+#[expect(unsafe_code)]
+unsafe impl CustomTraceable for PrefetchSink {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        unsafe { <Self as JSTraceable>::trace(self, trc) }
     }
 }
 
 impl Tokenizer {
-    pub fn new(document: &Document) -> Self {
+    pub(crate) fn new(document: &Document) -> Self {
+        let global = document.global();
         let sink = PrefetchSink {
-            origin: document.origin().immutable().clone(),
-            pipeline_id: document.global().pipeline_id(),
-            base_url: None,
+            pipeline_id: global.pipeline_id(),
+            webview_id: document.webview_id(),
+            base_url: RefCell::new(None),
             document_url: document.url(),
-            referrer: document.global().get_referrer(),
+            referrer: global.get_referrer(),
             referrer_policy: document.get_referrer_policy(),
             resource_threads: document.loader().resource_threads().clone(),
             // Initially we set prefetching to false, and only set it
             // true after the first script tag, since that is what will
             // block the main parser.
-            prefetching: false,
+            prefetching: Cell::new(false),
+            request_client: global.request_client(None),
         };
         let options = Default::default();
-        let inner = HtmlTokenizer::new(sink, options);
+        let inner = TraceableTokenizer(HtmlTokenizer::new(sink, options));
         Tokenizer { inner }
     }
 
-    pub fn feed(&mut self, input: &mut BufferQueue) {
+    pub(crate) fn feed(&self, input: &BufferQueue) {
         while let TokenizerResult::Script(PrefetchHandle) = self.inner.feed(input) {}
     }
 }
@@ -64,38 +90,37 @@ impl Tokenizer {
 #[derive(JSTraceable)]
 struct PrefetchSink {
     #[no_trace]
-    origin: ImmutableOrigin,
-    #[no_trace]
     pipeline_id: PipelineId,
+    #[no_trace]
+    webview_id: WebViewId,
     #[no_trace]
     document_url: ServoUrl,
     #[no_trace]
-    base_url: Option<ServoUrl>,
+    base_url: RefCell<Option<ServoUrl>>,
     #[no_trace]
     referrer: Referrer,
     #[no_trace]
-    referrer_policy: Option<ReferrerPolicy>,
+    referrer_policy: ReferrerPolicy,
     #[no_trace]
     resource_threads: ResourceThreads,
-    prefetching: bool,
+    prefetching: Cell<bool>,
+    #[no_trace]
+    request_client: RequestClient,
 }
 
 /// The prefetch tokenizer produces trivial results
+#[derive(Clone, Copy, JSTraceable)]
 struct PrefetchHandle;
 
 impl TokenSink for PrefetchSink {
     type Handle = PrefetchHandle;
-    fn process_token(
-        &mut self,
-        token: Token,
-        _line_number: u64,
-    ) -> TokenSinkResult<PrefetchHandle> {
+    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<PrefetchHandle> {
         let tag = match token {
             Token::TagToken(ref tag) => tag,
             _ => return TokenSinkResult::Continue,
         };
         match (tag.kind, &tag.name) {
-            (TagKind::StartTag, &local_name!("script")) if self.prefetching => {
+            (TagKind::StartTag, &local_name!("script")) if self.prefetching.get() => {
                 if let Some(url) = self.get_url(tag, local_name!("src")) {
                     debug!("Prefetch script {}", url);
                     let cors_setting = self.get_cors_settings(tag, local_name!("crossorigin"));
@@ -103,71 +128,84 @@ impl TokenSink for PrefetchSink {
                         .get_attr(tag, local_name!("integrity"))
                         .map(|attr| String::from(&attr.value))
                         .unwrap_or_default();
+                    let cryptographic_nonce = self
+                        .get_attr(tag, local_name!("nonce"))
+                        .map(|attr| String::from(&attr.value))
+                        .unwrap_or_default();
                     let request = script_fetch_request(
-                        url,
+                        self.webview_id,
+                        UrlWithBlobClaim::from_url_without_having_claimed_blob(url),
                         cors_setting,
-                        self.origin.clone(),
-                        self.pipeline_id,
                         ScriptFetchOptions {
-                            referrer: self.referrer.clone(),
                             referrer_policy: self.referrer_policy,
                             integrity_metadata,
-                            cryptographic_nonce: String::new(),
+                            cryptographic_nonce,
                             credentials_mode: CredentialsMode::CredentialsSameOrigin,
                             parser_metadata: ParserMetadata::ParserInserted,
+                            render_blocking: false,
                         },
-                    );
+                        self.referrer.clone(),
+                    )
+                    .client(self.request_client.clone())
+                    .pipeline_id(Some(self.pipeline_id));
                     let _ = self
                         .resource_threads
                         .send(CoreResourceMsg::Fetch(request, FetchChannels::Prefetch));
                 }
                 TokenSinkResult::RawData(RawKind::ScriptData)
             },
-            (TagKind::StartTag, &local_name!("img")) if self.prefetching => {
+            (TagKind::StartTag, &local_name!("img")) if self.prefetching.get() => {
                 if let Some(url) = self.get_url(tag, local_name!("src")) {
                     debug!("Prefetch {} {}", tag.name, url);
-                    let request = image_fetch_request(
+                    let request = create_a_potential_cors_request(
+                        Some(self.webview_id),
                         url,
-                        self.origin.clone(),
-                        self.referrer.clone(),
-                        self.pipeline_id,
+                        Destination::Image,
                         self.get_cors_settings(tag, local_name!("crossorigin")),
-                        self.get_referrer_policy(tag, local_name!("referrerpolicy")),
-                        FromPictureOrSrcSet::No,
-                    );
+                        None,
+                        self.referrer.clone(),
+                    )
+                    .client(self.request_client.clone())
+                    .pipeline_id(Some(self.pipeline_id))
+                    .referrer_policy(self.get_referrer_policy(tag, local_name!("referrerpolicy")));
+
                     let _ = self
                         .resource_threads
                         .send(CoreResourceMsg::Fetch(request, FetchChannels::Prefetch));
                 }
                 TokenSinkResult::Continue
             },
-            (TagKind::StartTag, &local_name!("link")) if self.prefetching => {
-                if let Some(rel) = self.get_attr(tag, local_name!("rel")) {
-                    if rel.value.eq_ignore_ascii_case("stylesheet") {
-                        if let Some(url) = self.get_url(tag, local_name!("href")) {
-                            debug!("Prefetch {} {}", tag.name, url);
-                            let cors_setting =
-                                self.get_cors_settings(tag, local_name!("crossorigin"));
-                            let referrer_policy =
-                                self.get_referrer_policy(tag, local_name!("referrerpolicy"));
-                            let integrity_metadata = self
-                                .get_attr(tag, local_name!("integrity"))
-                                .map(|attr| String::from(&attr.value))
-                                .unwrap_or_default();
-                            let request = stylesheet_fetch_request(
-                                url,
-                                cors_setting,
-                                self.origin.clone(),
-                                self.pipeline_id,
-                                self.referrer.clone(),
-                                referrer_policy,
-                                integrity_metadata,
-                            );
-                            let _ = self
-                                .resource_threads
-                                .send(CoreResourceMsg::Fetch(request, FetchChannels::Prefetch));
-                        }
-                    }
+            (TagKind::StartTag, &local_name!("link")) if self.prefetching.get() => {
+                if let Some(rel) = self.get_attr(tag, local_name!("rel")) &&
+                    rel.value.eq_ignore_ascii_case("stylesheet") &&
+                    let Some(url) = self.get_url(tag, local_name!("href"))
+                {
+                    debug!("Prefetch {} {}", tag.name, url);
+                    let cors_setting = self.get_cors_settings(tag, local_name!("crossorigin"));
+                    let referrer_policy =
+                        self.get_referrer_policy(tag, local_name!("referrerpolicy"));
+                    let integrity_metadata = self
+                        .get_attr(tag, local_name!("integrity"))
+                        .map(|attr| String::from(&attr.value))
+                        .unwrap_or_default();
+
+                    // https://html.spec.whatwg.org/multipage/#default-fetch-and-process-the-linked-resource
+                    let request = create_a_potential_cors_request(
+                        Some(self.webview_id),
+                        url,
+                        Destination::Style,
+                        cors_setting,
+                        None,
+                        self.referrer.clone(),
+                    )
+                    .client(self.request_client.clone())
+                    .pipeline_id(Some(self.pipeline_id))
+                    .referrer_policy(referrer_policy)
+                    .integrity_metadata(integrity_metadata);
+
+                    let _ = self
+                        .resource_threads
+                        .send(CoreResourceMsg::Fetch(request, FetchChannels::Prefetch));
                 }
                 TokenSinkResult::Continue
             },
@@ -176,15 +214,15 @@ impl TokenSink for PrefetchSink {
             },
             (TagKind::EndTag, &local_name!("script")) => {
                 // After the first script tag, the main parser is blocked, so it's worth prefetching.
-                self.prefetching = true;
+                self.prefetching.set(true);
                 TokenSinkResult::Script(PrefetchHandle)
             },
             (TagKind::StartTag, &local_name!("base")) => {
-                if let Some(url) = self.get_url(tag, local_name!("href")) {
-                    if self.base_url.is_none() {
-                        debug!("Setting base {}", url);
-                        self.base_url = Some(url);
-                    }
+                if let Some(url) = self.get_url(tag, local_name!("href")) &&
+                    self.base_url.borrow().is_none()
+                {
+                    debug!("Setting base {}", url);
+                    *self.base_url.borrow_mut() = Some(url);
                 }
                 TokenSinkResult::Continue
             },
@@ -200,24 +238,19 @@ impl PrefetchSink {
 
     fn get_url(&self, tag: &Tag, name: LocalName) -> Option<ServoUrl> {
         let attr = self.get_attr(tag, name)?;
-        let base = self.base_url.as_ref().unwrap_or(&self.document_url);
+        let base_url = self.base_url.borrow();
+        let base = base_url.as_ref().unwrap_or(&self.document_url);
         ServoUrl::parse_with_base(Some(base), &attr.value).ok()
     }
 
-    fn get_referrer_policy(&self, tag: &Tag, name: LocalName) -> Option<ReferrerPolicy> {
+    fn get_referrer_policy(&self, tag: &Tag, name: LocalName) -> ReferrerPolicy {
         self.get_attr(tag, name)
-            .and_then(|attr| determine_policy_for_token(&attr.value))
-            .or(self.referrer_policy)
+            .map(|attr| ReferrerPolicy::from(&*attr.value))
+            .unwrap_or(self.referrer_policy)
     }
 
     fn get_cors_settings(&self, tag: &Tag, name: LocalName) -> Option<CorsSettings> {
-        let crossorigin = self.get_attr(tag, name)?;
-        if crossorigin.value.eq_ignore_ascii_case("anonymous") {
-            Some(CorsSettings::Anonymous)
-        } else if crossorigin.value.eq_ignore_ascii_case("use-credentials") {
-            Some(CorsSettings::UseCredentials)
-        } else {
-            None
-        }
+        let attr = self.get_attr(tag, name)?;
+        determine_cors_settings_for_token(&attr.value)
     }
 }

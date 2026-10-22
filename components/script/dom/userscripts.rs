@@ -2,58 +2,32 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fs::{read_dir, File};
-use std::io::Read;
-use std::path::PathBuf;
-use std::rc::Rc;
+use script_bindings::root::DomRoot;
 
-use js::jsval::UndefinedValue;
+use crate::dom::html::htmlheadelement::HTMLHeadElement;
+use crate::dom::node::NodeTraits;
+use crate::dom::window::Window;
+use crate::realms::enter_auto_realm;
 
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::str::DOMString;
-use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlscriptelement::SourceCode;
-use crate::dom::node::document_from_node;
-use crate::script_module::ScriptFetchOptions;
+pub(crate) fn load_script(head: &HTMLHeadElement) {
+    let doc = head.owner_document();
+    let userscripts = doc.window().userscripts().to_owned();
+    if userscripts.is_empty() {
+        return;
+    }
+    let win = DomRoot::from_ref(doc.window());
+    doc.add_delayed_task(task!(UserScriptExecute: |cx, win: DomRoot<Window>| {
+        let global_scope = win.as_global_scope();
+        let mut realm = enter_auto_realm(cx, global_scope);
+        let cx = &mut realm.current_realm();
 
-pub fn load_script(head: &HTMLHeadElement) {
-    let doc = document_from_node(head);
-    let path_str = match doc.window().get_userscripts_path() {
-        Some(p) => p,
-        None => return,
-    };
-    let win = Trusted::new(doc.window());
-    doc.add_delayed_task(task!(UserScriptExecute: move || {
-        let win = win.root();
-        let cx = win.get_cx();
-        rooted!(in(*cx) let mut rval = UndefinedValue());
-
-        let path = PathBuf::from(&path_str);
-        let mut files = read_dir(path)
-            .expect("Bad path passed to --userscripts")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect::<Vec<_>>();
-
-        files.sort();
-
-        for file in files {
-            let mut f = File::open(&file).unwrap();
-            let mut contents = vec![];
-            f.read_to_end(&mut contents).unwrap();
-            let script_text = SourceCode::Text(
-                Rc::new(DOMString::from_string(String::from_utf8_lossy(&contents).to_string()))
-            );
-            let global = win.upcast::<GlobalScope>();
-            global.evaluate_script_on_global_with_result(
-                &script_text,
-                &file.to_string_lossy(),
-                rval.handle_mut(),
-                1,
-                ScriptFetchOptions::default_classic_script(global),
-                global.api_base_url(),
+        for user_script in userscripts {
+            _ = global_scope.evaluate_js_on_global(
+                cx,
+                user_script.script().into(),
+                &user_script.source_file().map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+                None,
+                None,
             );
         }
     }));

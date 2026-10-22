@@ -2,107 +2,173 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Liberally derived from the [Firefox JS implementation](http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webconsole.js).
+//! Liberally derived from the [Firefox JS implementation](https://searchfox.org/firefox-main/source/devtools/server/actors/webconsole.js).
 //! Mediates interaction between the remote web console and equivalent functionality (object
 //! inspection, JS evaluation, autocompletion) in Servo.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use base::id::TEST_PIPELINE_ID;
-use devtools_traits::EvaluateJSReply::{
-    ActorValue, BooleanValue, NullValue, NumberValue, StringValue, VoidValue,
-};
+use atomic_refcell::AtomicRefCell;
 use devtools_traits::{
-    CachedConsoleMessage, CachedConsoleMessageTypes, ConsoleAPI, ConsoleMessage,
-    DevtoolScriptControlMsg, LogLevel, PageError,
+    ConsoleMessage, ConsoleMessageFields, DevtoolScriptControlMsg, GetEnvironmentRequest,
+    PageError, StackFrame, get_time_stamp,
 };
-use ipc_channel::ipc::{self, IpcSender};
-use log::debug;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
-use serde_json::{self, Map, Number, Value};
+use serde_json::{self, Map, Value};
+use servo_base::generic_channel::{self, GenericSender, channel};
+use servo_base::id::{PipelineId, TEST_PIPELINE_ID};
 use uuid::Uuid;
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::browsing_context::BrowsingContextActor;
-use crate::actors::object::ObjectActor;
-use crate::actors::worker::WorkerActor;
-use crate::protocol::JsonPacketStream;
-use crate::{StreamId, UniqueId};
+use crate::actors::environment::EnvironmentActor;
+use crate::actors::worker::WorkerTargetActor;
+use crate::protocol::{ClientRequest, DevtoolsConnection, JsonPacketStream};
+use crate::resource::{ResourceArrayType, ResourceAvailable};
+use crate::{EmptyReplyMsg, StreamId, UniqueId, debugger_value_to_json};
 
-trait EncodableConsoleMessage {
-    fn encode(&self) -> serde_json::Result<String>;
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DevtoolsConsoleMessage {
+    #[serde(flatten)]
+    fields: ConsoleMessageFields,
+    #[ignore_malloc_size_of = "Currently no way to have serde_json::Value"]
+    arguments: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stacktrace: Option<Vec<StackFrame>>,
+    // Not implemented in Servo
+    // inner_window_id
+    // source_id
 }
 
-impl EncodableConsoleMessage for CachedConsoleMessage {
-    fn encode(&self) -> serde_json::Result<String> {
-        match *self {
-            CachedConsoleMessage::PageError(ref a) => serde_json::to_string(a),
-            CachedConsoleMessage::ConsoleAPI(ref a) => serde_json::to_string(a),
+impl DevtoolsConsoleMessage {
+    pub(crate) fn new(message: ConsoleMessage, registry: &ActorRegistry) -> Self {
+        Self {
+            fields: message.fields,
+            arguments: message
+                .arguments
+                .into_iter()
+                .map(|argument| debugger_value_to_json(registry, argument))
+                .collect(),
+            stacktrace: message.stacktrace,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+struct DevtoolsPageError {
+    #[serde(flatten)]
+    page_error: PageError,
+    category: String,
+    error: bool,
+    warning: bool,
+    info: bool,
+    private: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stacktrace: Option<Vec<StackFrame>>,
+    // Not implemented in Servo
+    // inner_window_id
+    // source_id
+    // has_exception
+    // exception
+}
+
+impl From<PageError> for DevtoolsPageError {
+    fn from(page_error: PageError) -> Self {
+        Self {
+            page_error,
+            category: "script".to_string(),
+            error: true,
+            warning: false,
+            info: false,
+            private: false,
+            stacktrace: None,
+        }
+    }
+}
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageErrorWrapper {
+    page_error: DevtoolsPageError,
+}
+
+impl From<PageError> for PageErrorWrapper {
+    fn from(page_error: PageError) -> Self {
+        Self {
+            page_error: page_error.into(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(untagged)]
+pub(crate) enum ConsoleResource {
+    ConsoleMessage(DevtoolsConsoleMessage),
+    PageError(PageErrorWrapper),
+}
+
+impl ConsoleResource {
+    pub fn resource_type(&self) -> String {
+        match self {
+            ConsoleResource::ConsoleMessage(_) => "console-message".into(),
+            ConsoleResource::PageError(_) => "error-message".into(),
         }
     }
 }
 
 #[derive(Serialize)]
-struct StartedListenersTraits;
-
-#[derive(Serialize)]
-struct StartedListenersReply {
-    from: String,
-    nativeConsoleAPI: bool,
-    startedListeners: Vec<String>,
-    traits: StartedListenersTraits,
+pub struct ConsoleClearMessage {
+    pub level: String,
 }
 
 #[derive(Serialize)]
-struct GetCachedMessagesReply {
-    from: String,
-    messages: Vec<Map<String, Value>>,
-}
-
-#[derive(Serialize)]
-struct StopListenersReply {
-    from: String,
-    stoppedListeners: Vec<String>,
-}
-
-#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AutocompleteReply {
     from: String,
     matches: Vec<String>,
-    matchProp: String,
+    match_prop: String,
+    is_element_access: bool,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct EvaluateJSReply {
     from: String,
     input: String,
     result: Value,
     timestamp: u64,
     exception: Value,
-    exceptionMessage: Value,
-    helperResult: Value,
+    exception_message: Option<String>,
+    has_exception: bool,
+    helper_result: Value,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct EvaluateJSEvent {
     from: String,
-    r#type: String,
+    #[serde(rename = "type")]
+    type_: String,
     input: String,
     result: Value,
     timestamp: u64,
-    resultID: String,
+    #[serde(rename = "resultID")]
+    result_id: String,
     exception: Value,
-    exceptionMessage: Value,
-    helperResult: Value,
+    exception_message: Option<String>,
+    has_exception: bool,
+    helper_result: Value,
 }
 
 #[derive(Serialize)]
 struct EvaluateJSAsyncReply {
     from: String,
-    resultID: String,
+    #[serde(rename = "resultID")]
+    result_id: String,
 }
 
 #[derive(Serialize)]
@@ -111,416 +177,331 @@ struct SetPreferencesReply {
     updated: Vec<String>,
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) enum Root {
     BrowsingContext(String),
     DedicatedWorker(String),
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct ConsoleActor {
-    pub name: String,
-    pub root: Root,
-    pub cached_events: RefCell<HashMap<UniqueId, Vec<CachedConsoleMessage>>>,
+    name: String,
+    root: Root,
+    cached_events: AtomicRefCell<HashMap<UniqueId, Vec<ConsoleResource>>>,
+    /// Used to control whether to send resource array messages from
+    /// `handle_console_resource`. It starts being false, and it only gets
+    /// activated after the client requests `console-message` or `error-message`
+    /// resources for the first time. Otherwise we would be sending messages
+    /// before the client is ready to receive them.
+    client_ready_to_receive_messages: AtomicBool,
 }
 
 impl ConsoleActor {
-    fn script_chan<'a>(
-        &self,
-        registry: &'a ActorRegistry,
-    ) -> &'a IpcSender<DevtoolScriptControlMsg> {
-        match &self.root {
-            Root::BrowsingContext(bc) => &registry.find::<BrowsingContextActor>(bc).script_chan,
-            Root::DedicatedWorker(worker) => &registry.find::<WorkerActor>(worker).script_chan,
-        }
+    pub fn register(registry: &ActorRegistry, name: String, root: Root) -> Arc<Self> {
+        let actor = Self {
+            name,
+            root,
+            cached_events: Default::default(),
+            client_ready_to_receive_messages: false.into(),
+        };
+        registry.register::<Self>(actor)
     }
 
-    fn streams_mut(&self, registry: &ActorRegistry, cb: impl Fn(&mut TcpStream)) {
+    fn script_chan(&self, registry: &ActorRegistry) -> GenericSender<DevtoolScriptControlMsg> {
         match &self.root {
-            Root::BrowsingContext(bc) => registry
-                .find::<BrowsingContextActor>(bc)
-                .streams
-                .borrow_mut()
-                .values_mut()
-                .for_each(cb),
-            Root::DedicatedWorker(worker) => registry
-                .find::<WorkerActor>(worker)
-                .streams
-                .borrow_mut()
-                .values_mut()
-                .for_each(cb),
+            Root::BrowsingContext(browsing_context_name) => registry
+                .find::<BrowsingContextActor>(browsing_context_name)
+                .script_chan(),
+            Root::DedicatedWorker(worker_name) => registry
+                .find::<WorkerTargetActor>(worker_name)
+                .script_sender
+                .clone(),
         }
     }
 
     fn current_unique_id(&self, registry: &ActorRegistry) -> UniqueId {
         match &self.root {
-            Root::BrowsingContext(bc) => UniqueId::Pipeline(
+            Root::BrowsingContext(browsing_context_name) => UniqueId::Pipeline(
                 registry
-                    .find::<BrowsingContextActor>(bc)
-                    .active_pipeline
-                    .get(),
+                    .find::<BrowsingContextActor>(browsing_context_name)
+                    .pipeline_id(),
             ),
-            Root::DedicatedWorker(w) => UniqueId::Worker(registry.find::<WorkerActor>(w).id),
+            Root::DedicatedWorker(worker_name) => {
+                UniqueId::Worker(registry.find::<WorkerTargetActor>(worker_name).worker_id)
+            },
         }
     }
 
-    fn evaluateJS(
+    fn pipeline_id(&self, registry: &ActorRegistry) -> PipelineId {
+        // FIXME: Redesign messages so we don't have to fake pipeline ids when communicating with workers.
+        match self.current_unique_id(registry) {
+            UniqueId::Pipeline(p) => p,
+            UniqueId::Worker(_) => TEST_PIPELINE_ID,
+        }
+    }
+
+    fn evaluate_js(
         &self,
         registry: &ActorRegistry,
         msg: &Map<String, Value>,
     ) -> Result<EvaluateJSReply, ()> {
         let input = msg.get("text").unwrap().as_str().unwrap().to_owned();
-        let (chan, port) = ipc::channel().unwrap();
-        // FIXME: redesign messages so we don't have to fake pipeline ids when
-        //        communicating with workers.
-        let pipeline = match self.current_unique_id(registry) {
-            UniqueId::Pipeline(p) => p,
-            UniqueId::Worker(_) => TEST_PIPELINE_ID,
-        };
+        let eager = msg.get("eager").and_then(|v| v.as_bool()).unwrap_or(false);
+        let frame_actor_id = msg
+            .get("frameActor")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let (chan, port) = generic_channel::channel().unwrap();
         self.script_chan(registry)
-            .send(DevtoolScriptControlMsg::EvaluateJS(
-                pipeline,
+            .send(DevtoolScriptControlMsg::Eval(
                 input.clone(),
+                self.pipeline_id(registry),
+                frame_actor_id,
+                eager,
                 chan,
             ))
             .unwrap();
 
-        //TODO: extract conversion into protocol module or some other useful place
-        let result = match port.recv().map_err(|_| ())? {
-            VoidValue => {
-                let mut m = Map::new();
-                m.insert("type".to_owned(), Value::String("undefined".to_owned()));
-                Value::Object(m)
-            },
-            NullValue => {
-                let mut m = Map::new();
-                m.insert("type".to_owned(), Value::String("null".to_owned()));
-                Value::Object(m)
-            },
-            BooleanValue(val) => Value::Bool(val),
-            NumberValue(val) => {
-                if val.is_nan() {
-                    let mut m = Map::new();
-                    m.insert("type".to_owned(), Value::String("NaN".to_owned()));
-                    Value::Object(m)
-                } else if val.is_infinite() {
-                    let mut m = Map::new();
-                    if val < 0. {
-                        m.insert("type".to_owned(), Value::String("-Infinity".to_owned()));
-                    } else {
-                        m.insert("type".to_owned(), Value::String("Infinity".to_owned()));
-                    }
-                    Value::Object(m)
-                } else if val == 0. && val.is_sign_negative() {
-                    let mut m = Map::new();
-                    m.insert("type".to_owned(), Value::String("-0".to_owned()));
-                    Value::Object(m)
-                } else {
-                    Value::Number(Number::from_f64(val).unwrap())
-                }
-            },
-            StringValue(s) => Value::String(s),
-            ActorValue { class, uuid } => {
-                //TODO: make initial ActorValue message include these properties?
-                let mut m = Map::new();
-                let actor = ObjectActor::register(registry, uuid);
-
-                m.insert("type".to_owned(), Value::String("object".to_owned()));
-                m.insert("class".to_owned(), Value::String(class));
-                m.insert("actor".to_owned(), Value::String(actor));
-                m.insert("extensible".to_owned(), Value::Bool(true));
-                m.insert("frozen".to_owned(), Value::Bool(false));
-                m.insert("sealed".to_owned(), Value::Bool(false));
-                Value::Object(m)
-            },
+        let eval_result = port.recv().map_err(|_| ())?;
+        let has_exception = eval_result.has_exception;
+        let (result, exception) = if has_exception {
+            (
+                Value::Null,
+                debugger_value_to_json(registry, eval_result.value),
+            )
+        } else {
+            (
+                debugger_value_to_json(registry, eval_result.value),
+                Value::Null,
+            )
         };
-
-        //TODO: catch and return exception values from JS evaluation
         let reply = EvaluateJSReply {
-            from: self.name(),
+            from: self.name().into(),
             input,
             result,
-            timestamp: 0,
-            exception: Value::Null,
-            exceptionMessage: Value::Null,
-            helperResult: Value::Null,
+            timestamp: get_time_stamp(),
+            exception,
+            exception_message: eval_result.exception_message,
+            has_exception,
+            helper_result: Value::Null,
         };
-        std::result::Result::Ok(reply)
+        Ok(reply)
     }
 
-    pub(crate) fn handle_page_error(
+    pub(crate) fn handle_console_resource(
         &self,
-        page_error: PageError,
+        resource: ConsoleResource,
         id: UniqueId,
         registry: &ActorRegistry,
+        stream: &mut DevtoolsConnection,
     ) {
         self.cached_events
             .borrow_mut()
             .entry(id.clone())
             .or_default()
-            .push(CachedConsoleMessage::PageError(page_error.clone()));
-        if id == self.current_unique_id(registry) {
-            let msg = PageErrorMsg {
-                from: self.name(),
-                type_: "pageError".to_owned(),
-                pageError: page_error,
-            };
-            self.streams_mut(registry, |stream| {
-                let _ = stream.write_json_packet(&msg);
-            });
+            .push(resource.clone());
+        if !self
+            .client_ready_to_receive_messages
+            .load(Ordering::Relaxed)
+        {
+            return;
         }
+        let resource_type = resource.resource_type();
+        if id == self.current_unique_id(registry) &&
+            let Root::BrowsingContext(browsing_context_name) = &self.root
+        {
+            registry
+                .find::<BrowsingContextActor>(browsing_context_name)
+                .resource_array(
+                    resource,
+                    resource_type,
+                    ResourceArrayType::Available,
+                    stream,
+                )
+        };
     }
 
-    pub(crate) fn handle_console_api(
+    pub(crate) fn send_clear_message(
         &self,
-        console_message: ConsoleMessage,
         id: UniqueId,
         registry: &ActorRegistry,
+        stream: &mut DevtoolsConnection,
     ) {
-        let level = match console_message.logLevel {
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
-            LogLevel::Clear => "clear",
-            _ => "log",
-        }
-        .to_owned();
-        self.cached_events
-            .borrow_mut()
-            .entry(id.clone())
-            .or_default()
-            .push(CachedConsoleMessage::ConsoleAPI(ConsoleAPI {
-                type_: "ConsoleAPI".to_owned(),
-                level: level.clone(),
-                filename: console_message.filename.clone(),
-                lineNumber: console_message.lineNumber as u32,
-                functionName: "".to_string(), //TODO
-                timeStamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64,
-                private: false,
-                arguments: vec![console_message.message.clone()],
-            }));
-        if id == self.current_unique_id(registry) {
-            let msg = ConsoleAPICall {
-                from: self.name(),
-                type_: "consoleAPICall".to_owned(),
-                message: ConsoleMsg {
-                    level,
-                    timeStamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
-                    arguments: vec![console_message.message],
-                    filename: console_message.filename,
-                    lineNumber: console_message.lineNumber,
-                    columnNumber: console_message.columnNumber,
-                },
-            };
-            self.streams_mut(registry, |stream| {
-                let _ = stream.write_json_packet(&msg);
-            });
+        if id == self.current_unique_id(registry) &&
+            let Root::BrowsingContext(browsing_context_name) = &self.root
+        {
+            registry
+                .find::<BrowsingContextActor>(browsing_context_name)
+                .resource_array(
+                    ConsoleClearMessage {
+                        level: "clear".to_owned(),
+                    },
+                    "console-message".into(),
+                    ResourceArrayType::Available,
+                    stream,
+                )
+        };
+    }
+
+    pub(crate) fn get_cached_messages(
+        &self,
+        registry: &ActorRegistry,
+        resource: &str,
+    ) -> Vec<ConsoleResource> {
+        let id = self.current_unique_id(registry);
+        let cached_events = self.cached_events.borrow();
+        let Some(events) = cached_events.get(&id) else {
+            return vec![];
+        };
+        events
+            .iter()
+            .filter(|event| event.resource_type() == resource)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn received_first_message_from_client(&self) {
+        self.client_ready_to_receive_messages
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Matching function with conditional case-sensitivity as per:
+    /// <https://searchfox.org/firefox-main/rev/7fa9b602777418732e08b26d1ef6c9945c4bbd72/devtools/shared/webconsole/js-property-provider.js#617-622>
+    pub(crate) fn autocomplete_match(prefix: &str, identifier: &str) -> bool {
+        let is_insensitive = prefix.chars().next().is_some_and(|c| c.is_lowercase());
+        if is_insensitive {
+            identifier
+                .to_lowercase()
+                .starts_with(&prefix.to_lowercase())
+        } else {
+            identifier.starts_with(prefix)
         }
     }
 }
 
 impl Actor for ConsoleActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
-            "clearMessagesCache" => {
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "clearMessagesCacheAsync" => {
                 self.cached_events
                     .borrow_mut()
                     .remove(&self.current_unique_id(registry));
-                ActorMessageStatus::Processed
-            },
-
-            "getCachedMessages" => {
-                let str_types = msg
-                    .get("messageTypes")
-                    .unwrap()
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|json_type| json_type.as_str().unwrap());
-                let mut message_types = CachedConsoleMessageTypes::empty();
-                for str_type in str_types {
-                    match str_type {
-                        "PageError" => message_types.insert(CachedConsoleMessageTypes::PAGE_ERROR),
-                        "ConsoleAPI" => {
-                            message_types.insert(CachedConsoleMessageTypes::CONSOLE_API)
-                        },
-                        s => debug!("unrecognized message type requested: \"{}\"", s),
-                    };
-                }
-                let mut messages = vec![];
-                for event in self
-                    .cached_events
-                    .borrow()
-                    .get(&self.current_unique_id(registry))
-                    .unwrap_or(&vec![])
-                    .iter()
-                {
-                    let include = match event {
-                        CachedConsoleMessage::PageError(_)
-                            if message_types.contains(CachedConsoleMessageTypes::PAGE_ERROR) =>
-                        {
-                            true
-                        },
-                        CachedConsoleMessage::ConsoleAPI(_)
-                            if message_types.contains(CachedConsoleMessageTypes::CONSOLE_API) =>
-                        {
-                            true
-                        },
-                        _ => false,
-                    };
-                    if include {
-                        let json_string = event.encode().unwrap();
-                        let json = serde_json::from_str::<Value>(&json_string).unwrap();
-                        messages.push(json.as_object().unwrap().to_owned())
-                    }
-                }
-
-                let msg = GetCachedMessagesReply {
-                    from: self.name(),
-                    messages,
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            "startListeners" => {
-                //TODO: actually implement listener filters that support starting/stopping
-                let listeners = msg.get("listeners").unwrap().as_array().unwrap().to_owned();
-                let msg = StartedListenersReply {
-                    from: self.name(),
-                    nativeConsoleAPI: true,
-                    startedListeners: listeners
-                        .into_iter()
-                        .map(|s| s.as_str().unwrap().to_owned())
-                        .collect(),
-                    traits: StartedListenersTraits,
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
-
-            "stopListeners" => {
-                //TODO: actually implement listener filters that support starting/stopping
-                let msg = StopListenersReply {
-                    from: self.name(),
-                    stoppedListeners: msg
-                        .get("listeners")
-                        .unwrap()
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .map(|listener| listener.as_str().unwrap().to_owned())
-                        .collect(),
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
-
-            //TODO: implement autocompletion like onAutocomplete in
-            //      http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webconsole.js
             "autocomplete" => {
-                let msg = AutocompleteReply {
-                    from: self.name(),
-                    matches: vec![],
-                    matchProp: "".to_owned(),
+                let Some((tx, rx)) = channel() else {
+                    return Err(ActorError::Internal);
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+
+                let env_request = if let Some(frame_actor) = msg
+                    .get("frameActor")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                {
+                    GetEnvironmentRequest::Frame(frame_actor)
+                } else {
+                    GetEnvironmentRequest::Global(self.pipeline_id(registry))
+                };
+
+                self.script_chan(registry)
+                    .send(DevtoolScriptControlMsg::GetEnvironment(env_request, tx))
+                    .map_err(|_| ActorError::Internal)?;
+
+                let environment_name = rx.recv().map_err(|_| ActorError::Internal)?;
+                let environment_actor = registry.find::<EnvironmentActor>(&environment_name);
+
+                let prompt = msg
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .ok_or(ActorError::Internal)?;
+
+                let identifiers = environment_actor.search_identifiers_recursive(registry, &prompt);
+
+                let matches: Vec<String> = identifiers
+                    .into_iter()
+                    .filter(|name| ConsoleActor::autocomplete_match(&prompt, name))
+                    .collect();
+
+                let msg = if matches.is_empty() {
+                    AutocompleteReply {
+                        from: self.name().into(),
+                        matches: vec![],
+                        match_prop: String::new(),
+                        is_element_access: false,
+                    }
+                } else {
+                    AutocompleteReply {
+                        from: self.name().into(),
+                        matches,
+                        match_prop: prompt,
+                        is_element_access: false,
+                    }
+                };
+                request.reply_final(&msg)?
             },
 
             "evaluateJS" => {
-                let msg = self.evaluateJS(registry, msg);
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                let msg = self.evaluate_js(registry, msg);
+                request.reply_final(&msg)?
             },
 
             "evaluateJSAsync" => {
-                let resultID = Uuid::new_v4().to_string();
+                let result_id = Uuid::new_v4().to_string();
                 let early_reply = EvaluateJSAsyncReply {
-                    from: self.name(),
-                    resultID: resultID.clone(),
+                    from: self.name().into(),
+                    result_id: result_id.clone(),
                 };
                 // Emit an eager reply so that the client starts listening
                 // for an async event with the resultID
-                if stream.write_json_packet(&early_reply).is_err() {
-                    return Ok(ActorMessageStatus::Processed);
-                }
+                let mut stream = request.reply(&early_reply)?;
 
-                if msg.get("eager").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    // We don't support the side-effect free evaluation that eager evalaution
-                    // really needs.
-                    return Ok(ActorMessageStatus::Processed);
-                }
-
-                let reply = self.evaluateJS(registry, msg).unwrap();
+                let reply = self.evaluate_js(registry, msg).unwrap();
                 let msg = EvaluateJSEvent {
-                    from: self.name(),
-                    r#type: "evaluationResult".to_owned(),
+                    from: self.name().into(),
+                    type_: "evaluationResult".to_owned(),
                     input: reply.input,
                     result: reply.result,
                     timestamp: reply.timestamp,
-                    resultID,
+                    result_id,
                     exception: reply.exception,
-                    exceptionMessage: reply.exceptionMessage,
-                    helperResult: reply.helperResult,
+                    exception_message: reply.exception_message,
+                    has_exception: reply.has_exception,
+                    helper_result: reply.helper_result,
                 };
                 // Send the data from evaluateJS along with a resultID
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                stream.write_json_packet(&msg)?
             },
 
             "setPreferences" => {
                 let msg = SetPreferencesReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     updated: vec![],
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            // NOTE: Do not handle `startListeners`, it is a legacy API.
+            // Instead, enable the resource in `WatcherActor::supported_resources`
+            // and handle the messages there.
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
-}
-
-#[derive(Serialize)]
-struct ConsoleAPICall {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    message: ConsoleMsg,
-}
-
-#[derive(Serialize)]
-struct ConsoleMsg {
-    level: String,
-    timeStamp: u64,
-    arguments: Vec<String>,
-    filename: String,
-    lineNumber: usize,
-    columnNumber: usize,
-}
-
-#[derive(Serialize)]
-struct PageErrorMsg {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    pageError: PageError,
 }

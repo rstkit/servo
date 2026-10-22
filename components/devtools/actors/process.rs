@@ -2,18 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Liberally derived from the [Firefox JS implementation]
-//! (https://searchfox.org/mozilla-central/source/devtools/server/actors/descriptors/process.js)
+//! Liberally derived from the [Firefox JS implementation].
+//!
+//! [Firefox JS implementation]: https://searchfox.org/mozilla-central/source/devtools/server/actors/descriptors/process.js
 
-use std::net::TcpStream;
+use std::sync::Arc;
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::actors::root::DescriptorTraits;
-use crate::protocol::JsonPacketStream;
 use crate::StreamId;
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::actors::root::DescriptorTraits;
+use crate::protocol::ClientRequest;
 
 #[derive(Serialize)]
 struct ListWorkersReply {
@@ -23,7 +25,7 @@ struct ListWorkersReply {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProcessActorMsg {
+pub(crate) struct ProcessActorMsg {
     actor: String,
     id: u32,
     is_parent: bool,
@@ -31,13 +33,14 @@ pub struct ProcessActorMsg {
     traits: DescriptorTraits,
 }
 
-pub struct ProcessActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct ProcessActor {
     name: String,
 }
 
 impl Actor for ProcessActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The process actor can handle the following messages:
@@ -45,35 +48,39 @@ impl Actor for ProcessActor {
     /// - `listWorkers`: Returns a list of web workers, not supported yet.
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "listWorkers" => {
                 let reply = ListWorkersReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     workers: vec![],
                 };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
+                request.reply_final(&reply)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl ProcessActor {
-    pub fn new(name: String) -> Self {
-        Self { name }
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self { name };
+        registry.register::<Self>(actor)
     }
+}
 
-    pub fn encodable(&self) -> ProcessActorMsg {
+impl ActorEncode<ProcessActorMsg> for ProcessActor {
+    fn encode(&self, _: &ActorRegistry) -> ProcessActorMsg {
         ProcessActorMsg {
-            actor: self.name(),
+            actor: self.name().into(),
             id: 0,
             is_parent: true,
             is_windowless_parent: false,

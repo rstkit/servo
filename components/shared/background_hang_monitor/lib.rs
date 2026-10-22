@@ -9,24 +9,26 @@
 use std::time::Duration;
 use std::{fmt, mem};
 
-use base::id::PipelineId;
-use ipc_channel::ipc::IpcSender;
 use serde::{Deserialize, Serialize};
+use servo_base::id::ScriptEventLoopId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 /// The equivalent of script::script_runtime::ScriptEventCategory
 pub enum ScriptHangAnnotation {
-    AttachLayout,
+    SpawnPipeline,
     ConstellationMsg,
+    DatabaseAccessEvent,
     DevtoolsMsg,
     DocumentEvent,
-    DomEvent,
     FileRead,
+    FontLoading,
     FormPlannedNavigation,
+    GeolocationEvent,
     ImageCacheMsg,
     InputEvent,
-    HistoryEvent,
+    NavigationAndTraversalEvent,
     NetworkEvent,
+    Rendering,
     Resize,
     ScriptEvent,
     SetScrollState,
@@ -49,24 +51,6 @@ pub enum ScriptHangAnnotation {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum HangAnnotation {
     Script(ScriptHangAnnotation),
-}
-
-/// Hang-alerts are sent by the monitor to the constellation.
-#[derive(Deserialize, Serialize)]
-pub enum HangMonitorAlert {
-    /// A component hang has been detected.
-    Hang(HangAlert),
-    /// Report a completed sampled profile.
-    Profile(Vec<u8>),
-}
-
-impl fmt::Debug for HangMonitorAlert {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            HangMonitorAlert::Hang(..) => write!(fmt, "Hang"),
-            HangMonitorAlert::Profile(..) => write!(fmt, "Profile"),
-        }
-    }
 }
 
 /// Hang-alerts are sent by the monitor to the constellation.
@@ -156,7 +140,7 @@ pub enum MonitoredComponentType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct MonitoredComponentId(pub PipelineId, pub MonitoredComponentType);
+pub struct MonitoredComponentId(pub ScriptEventLoopId, pub MonitoredComponentType);
 
 /// A handle to register components for hang monitoring,
 /// and to receive a means to communicate with the underlying hang monitor worker.
@@ -168,7 +152,7 @@ pub trait BackgroundHangMonitorRegister: BackgroundHangMonitorClone + Send {
         component: MonitoredComponentId,
         transient_hang_timeout: Duration,
         permanent_hang_timeout: Duration,
-        exit_signal: Option<Box<dyn BackgroundHangMonitorExitSignal>>,
+        exit_signal: Box<dyn BackgroundHangMonitorExitSignal>,
     ) -> Box<dyn BackgroundHangMonitor>;
 }
 
@@ -202,11 +186,8 @@ pub trait BackgroundHangMonitorExitSignal: Send {
 }
 
 /// Messages to control the sampling profiler.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum BackgroundHangMonitorControlMsg {
-    /// Enable the sampler, with a given sampling rate and max total sampling duration.
-    EnableSampler(Duration, Duration),
-    DisableSampler,
-    /// Exit, and propagate the signal to monitored components.
-    Exit(IpcSender<()>),
+    /// Propagate exit signal to monitored components, and shutdown when they have.
+    Exit,
 }

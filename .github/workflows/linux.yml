@@ -1,12 +1,20 @@
 name: Linux
 on:
   workflow_call:
+    outputs:
+      artifact_ids:
+        value: ${{ jobs.common.outputs.artifact_ids }}
+        description: Comma-separated list of artifact IDs for the release artifacts
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: string
-      wpt-tests-to-run:
+      build-args:
+        default: ""
+        required: false
+        type: string
+      wpt-args:
         default: ""
         required: false
         type: string
@@ -14,28 +22,50 @@ on:
         required: false
         default: false
         type: boolean
-      wpt-layout:
+      wpt:
         required: false
-        type: string
+        type: boolean
+      number-of-wpt-chunks:
+        default: 20
+        required: false
+        type: number
       unit-tests:
         required: false
         default: false
         type: boolean
-      upload:
+      devtools-tests:
         required: false
         default: false
         type: boolean
-      github-release-id:
+      build-libservo:
         required: false
-        type: string
+        default: false
+        type: boolean
+      force-github-hosted-runner:
+        required: false
+        type: boolean
+        default: false
+      bencher:
+        required: false
+        default: false
+        type: boolean
+      coverage:
+        required: false
+        default: false
+        type: boolean
+      capi:
+        required: false
+        default: false
+        type: boolean
+
   workflow_dispatch:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: choice
-        options: ["release", "debug", "production"]
-      wpt-tests-to-run:
+        options: ["checked-release", "release", "debug", "production"]
+      wpt-args:
         default: ""
         required: false
         type: string
@@ -43,15 +73,34 @@ on:
         default: false
         required: false
         type: boolean
-      wpt-layout:
+      wpt:
         required: false
-        type: choice
-        options: ["none", "2013", "2020", "all"]
+        type: boolean
+      number-of-wpt-chunks:
+        default: 20
+        required: false
+        type: number
       unit-tests:
         required: false
         default: false
         type: boolean
-      upload:
+      devtools-tests:
+        required: false
+        default: false
+        type: boolean
+      build-libservo:
+        required: false
+        default: false
+        type: boolean
+      force-github-hosted-runner:
+        required: false
+        type: boolean
+        default: false
+      bencher:
+        required: false
+        default: false
+        type: boolean
+      capi:
         required: false
         default: false
         type: boolean
@@ -59,122 +108,211 @@ on:
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CCACHE: "sccache"
-  CARGO_INCREMENTAL: 0
 
 jobs:
-  build:
-    name: Linux Build
-    # Ubuntu 22.04 has glibc 2.34 so the binaries produced
-    # won't run on systems with older glibc e.g wpt.fyi
-    # runners which still use 20.04.
-    runs-on: ubuntu-${{ inputs.upload && '20.04' || '22.04' }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 2 # This is necessary for `test-tidy`.
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
-        with:
-          ref: refs/pull/${{ github.event.number }}/head
-          fetch-depth: 2 # This is necessary for `test-tidy`.
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.4
-      - name: Set LIBCLANG_PATH env # needed for bindgen in mozangle
-        if: ${{ !inputs.upload  }} # not needed on ubuntu 20.04 used for nightly
-        run: echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install taplo
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: taplo-cli
-          locked: true
-      - name: Install cargo-deny
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: cargo-deny
-          locked: true
-      - name: Bootstrap Python
-        run: python3 -m pip install --upgrade pip
-      - name: Bootstrap dependencies
-        run: |
-          sudo apt update
-          python3 ./mach bootstrap
-      - name: Tidy
-        run: python3 ./mach test-tidy --no-progress --all
-      - name: Build (${{ inputs.profile }})
-        run: |
-          python3 ./mach build --use-crown --locked --${{ inputs.profile }}
-          cp -r target/cargo-timings target/cargo-timings-linux
-      - name: Smoketest
-        run: xvfb-run python3 ./mach smoketest --${{ inputs.profile  }}
-      - name: Script tests
-        run: ./mach test-scripts
-      - name: Unit tests
-        if: ${{ inputs.unit-tests }}
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 20
-          max_attempts: 2 # https://github.com/servo/servo/issues/30683
-          command: python ./mach test-unit --${{ inputs.profile }}
-      - name: Archive build timing
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-timings-linux
-          # Using a wildcard here ensures that the archive includes the path.
-          path: target/cargo-timings-*
-      - name: Build mach package
-        run: python3 ./mach package --${{ inputs.profile }}
-      - name: Upload artifact for mach package
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux
-          path: target/${{ inputs.profile }}/servo-tech-demo.tar.gz
-      - name: Upload nightly
-        if: ${{ inputs.upload }}
-        run: |
-          python3 ./mach upload-nightly linux \
-            --secret-from-environment \
-            --github-release-id ${{ inputs.github-release-id }}
-        env:
-          S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}
-          NIGHTLY_REPO_TOKEN: ${{ secrets.NIGHTLY_REPO_TOKEN }}
-          NIGHTLY_REPO: ${{ github.repository_owner }}/servo-nightly-builds
-      - name: Build package for target
-        run: tar -czf target.tar.gz target/${{ inputs.profile }}/servo resources
-      - name: Upload artifact for target
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.profile }}-binary-linux
-          path: target.tar.gz
+  common:
+    name: Call common Linux workflow for x86_64
+    uses: ./.github/workflows/linux-common.yml
+    secrets: inherit
+    with:
+      arch: x86_64
+      # Before updating the GH action runner image for the nightly job, ensure
+      # that the system has a glibc version that is compatible with the one
+      # used by the wpt.fyi runners.
+      uploaded-artifact-name: ${{ inputs.profile }}-binary-linux
+      github-runner-label: ubuntu-22.04
+      self-hosted-image-name: servo-ubuntu2204
+      force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+      profile: ${{ inputs.profile }}
+      build-args: ${{ inputs.build-args }}
+      wpt: ${{ inputs.wpt }}
+      number-of-wpt-chunks: ${{ inputs.number-of-wpt-chunks }}
+      unit-tests: ${{ inputs.unit-tests }}
+      devtools-tests: ${{ inputs.devtools-tests }}
+      build-libservo: ${{ inputs.build-libservo }}
+      wpt-args: ${{ inputs.wpt-args }}
+      bencher: ${{ inputs.bencher }}
+      coverage: ${{ inputs.coverage }}
+      capi: ${{ inputs.capi }}
+      perf-analysis: ${{ inputs.bencher && inputs.profile == 'checked-release' && github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
 
   wpt-2020:
-    if: ${{ inputs.wpt-layout == '2020' || inputs.wpt-layout == 'all' }}
+    if: ${{ inputs.wpt }}
     name: Linux WPT
-    needs: ["build"]
+    needs: ["common"]
     uses: ./.github/workflows/linux-wpt.yml
     with:
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      wpt-args: ${{ inputs.wpt-args }}
       profile: ${{ inputs.profile }}
       wpt-sync-from-upstream: ${{ inputs.wpt-sync-from-upstream }}
-      wpt-layout: "layout-2020"
+      number-of-wpt-chunks: ${{ inputs.number-of-wpt-chunks }}
+      binary-path: servo/servoshell
     secrets: inherit
 
-  wpt-2013:
-    if: ${{ inputs.wpt-layout == '2013' || inputs.wpt-layout == 'all' }}
-    name: Linux WPT (Legacy)
-    needs: ["build"]
-    uses: ./.github/workflows/linux-wpt.yml
+  bencher:
+    needs: ["common"]
+    if: >-
+      ${{
+          inputs.bencher &&
+          inputs.profile != 'debug' &&
+          github.event_name != 'workflow_dispatch' &&
+          github.event_name != 'merge_group'
+      }}
+    uses: ./.github/workflows/bencher.yml
     with:
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      target: "linux"
       profile: ${{ inputs.profile }}
-      wpt-sync-from-upstream: ${{ inputs.wpt-sync-from-upstream }}
-      wpt-layout: "layout-2013"
+      compressed-file-path: ${{ inputs.profile }}-binary-linux/servo-tech-demo.tar.gz
+      binary-path: servo/servoshell
+      file-size: true
+      # We only evaluate Perf analysis, speedometer and dromaeo score in 
+      # checked-release profile when triggered by T-bencher
+      speedometer: ${{ inputs.profile == 'checked-release' }}
+      dromaeo: ${{ inputs.profile == 'checked-release' }}
+      perf-analysis: ${{ inputs.profile == 'checked-release' }}
     secrets: inherit
+
+  # Runs the underlying job (“workload”) on a self-hosted runner if available.
+  runner-select-coverage:
+    if: inputs.coverage
+    runs-on: ubuntu-24.04
+    outputs:
+      unique-id: ${{ steps.select.outputs.unique-id }}
+      selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
+      is-self-hosted: ${{ steps.select.outputs.is-self-hosted }}
+    steps:
+      - name: Runner select
+        id: select
+        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Before updating the GH action runner image for the nightly job, ensure
+          # that the system has a glibc version that is compatible with the one
+          # used by the wpt.fyi runners.
+          github-hosted-runner-label: ubuntu-22.04
+          self-hosted-image-name: servo-ubuntu2204
+          # You can disable self-hosted runners globally by creating a repository variable named
+          # NO_SELF_HOSTED_RUNNERS with any non-empty value.
+          # <https://github.com/servo/servo/settings/variables/actions>
+          NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
+          # Any other boolean conditions that disable self-hosted runners go here.
+          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+
+  unit-test-coverage:
+    if: inputs.coverage
+    needs: runner-select-coverage
+    name: Unit Test Coverage [${{ needs.runner-select-coverage.outputs.unique-id }}]
+    runs-on: ${{ needs.runner-select-coverage.outputs.selected-runner-label }}
+    continue-on-error: true
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        if: ${{ runner.environment != 'self-hosted' }}
+        with:
+          tool-cache: false
+          large-packages: false
+          swap-storage: false
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
+      - name: Set LIBCLANG_PATH env
+        run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
+      - name: Setup Python
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: ./.github/actions/setup-python
+      - name: Change Mirror Priorities
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: ./.github/actions/apt-mirrors
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - name: Bootstrap dependencies
+        if: ${{ runner.environment != 'self-hosted' }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          sudo apt update
+          ./mach bootstrap --yes --skip-lints
+      - name: Run unit-tests with coverage
+        shell: bash
+        env:
+          NEXTEST_RETRIES: 2 # https://github.com/servo/servo/issues/30683
+          LANG: en-US
+        run: |
+          ./mach test-unit --code-coverage \
+              --profile=coverage \
+              --llvm-cov-option=--codecov \
+              --llvm-cov-option=--output-path=codecov.json
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json,support/crown/codecov.json
+          fail_ci_if_error: true
+          flags: unittests
+
+  media-examples:
+    name: Media Examples
+    if: ${{ inputs.unit-tests }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Change Mirror Priorities
+        uses: ./.github/actions/apt-mirrors
+      - name: Install Dependencies
+        run: |
+          sudo bash -c 'apt-add-repository -y https://mirrors.kernel.org/ubuntu'
+          sudo apt update
+          sudo apt install -y \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
+            jackd2 \
+            libasound2-plugins \
+            libfaad2 \
+            libffi7 \
+            libfftw3-single3 \
+            libges-1.0-dev \
+            libgstreamer-plugins-bad1.0-dev\
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
+            libgstrtspserver-1.0-dev \
+            libjack-jackd2-0 \
+            libmms0 \
+            libmpg123-0 \
+            libopus0 \
+            liborc-0.4-0 \
+            liborc-0.4-dev \
+            libpulsedsp \
+            libsamplerate0 \
+            libspeexdsp1 \
+            libtdb1 \
+            libtheora0 \
+            libtwolame0 \
+            libwayland-egl1-mesa \
+            libwebrtc-audio-processing1 \
+            pulseaudio \
+            pulseaudio-utils \
+            webp
+      - name: Determine MSRV
+        id: msrv
+        uses: ./.github/actions/parse_msrv
+      - name: Install MSRV
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.rust_version }}
+      - name: Virtual Audio Devices
+        run: |
+          jackd -d dummy &
+          pulseaudio --start
+          gst-inspect-1.0 | grep Total
+      - name: Run Examples
+        run: |
+          ls components/media/examples/examples/*.rs | xargs -I{} basename  {} .rs  | grep -v params_connect | RUST_BACKTRACE=1 GST_DEBUG=3 xargs -I{} cargo run -p servo-media-examples --example {}

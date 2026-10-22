@@ -2,12 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use ipc_channel::ipc::IpcSender;
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
-use servo_config::opts;
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::generic_channel::GenericSender;
+use time::Duration;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TimerMetadata {
@@ -16,12 +16,14 @@ pub struct TimerMetadata {
     pub incremental: TimerMetadataReflowType,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProfilerChan(pub IpcSender<ProfilerMsg>);
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+pub struct ProfilerChan(pub Option<GenericSender<ProfilerMsg>>);
 
 impl ProfilerChan {
     pub fn send(&self, msg: ProfilerMsg) {
-        if let Err(e) = self.0.send(msg) {
+        if let Some(sender) = &self.0 &&
+            let Err(e) = sender.send(msg)
+        {
             warn!("Error communicating with the time profiler thread: {}", e);
         }
     }
@@ -30,17 +32,20 @@ impl ProfilerChan {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ProfilerData {
     NoRecords,
-    Record(Vec<f64>),
+    Record(Vec<Duration>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ProfilerMsg {
     /// Normal message used for reporting time
-    Time((ProfilerCategory, Option<TimerMetadata>), (u64, u64)),
+    Time(
+        (ProfilerCategory, Option<TimerMetadata>),
+        (CrossProcessInstant, CrossProcessInstant),
+    ),
     /// Message used to get time spend entries for a particular ProfilerBuckets (in nanoseconds)
     Get(
         (ProfilerCategory, Option<TimerMetadata>),
-        IpcSender<ProfilerData>,
+        GenericSender<ProfilerData>,
     ),
     /// Message used to force print the profiling metrics
     Print,
@@ -49,73 +54,129 @@ pub enum ProfilerMsg {
     BlockedLayoutQuery(String),
 
     /// Tells the profiler to shut down.
-    Exit(IpcSender<()>),
+    Exit(GenericSender<()>),
 }
 
+/// Usage sites of variants marked “Rust tracing only” are not visible to rust-analyzer.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ProfilerCategory {
-    Compositing = 0x00,
-    LayoutPerform = 0x10,
-    LayoutStyleRecalc = 0x11,
-    LayoutTextShaping = 0x12,
-    LayoutRestyleDamagePropagation = 0x13,
-    LayoutNonIncrementalReset = 0x14,
-    LayoutSelectorMatch = 0x15,
-    LayoutTreeBuilder = 0x16,
-    LayoutDamagePropagate = 0x17,
-    LayoutGeneratedContent = 0x18,
-    LayoutDisplayListSorting = 0x19,
-    LayoutFloatPlacementSpeculation = 0x1a,
-    LayoutMain = 0x1b,
-    LayoutStoreOverflow = 0x1c,
-    LayoutParallelWarmup = 0x1d,
-    LayoutDispListBuild = 0x1e,
-    NetHTTPRequestResponse = 0x30,
-    PaintingPerTile = 0x41,
-    PaintingPrepBuff = 0x42,
-    Painting = 0x43,
-    ImageDecoding = 0x50,
+    /// `Paint` is rasterising or presenting.
+    ///
+    /// Not associated with a specific URL.
+    Painting = 0x00,
+
+    /// The script thread is doing layout work.
+    Layout = 0x10,
+
     ImageSaving = 0x51,
-    ScriptAttachLayout = 0x60,
+    ScriptSpawnPipeline = 0x60,
     ScriptConstellationMsg = 0x61,
     ScriptDevtoolsMsg = 0x62,
     ScriptDocumentEvent = 0x63,
-    ScriptDomEvent = 0x64,
+
+    /// Rust tracing only: the script thread is executing a script.
+    /// This may include time doing layout or parse work initiated by the script.
     ScriptEvaluate = 0x65,
+
     ScriptEvent = 0x66,
     ScriptFileRead = 0x67,
-    ScriptImageCacheMsg = 0x68,
-    ScriptInputEvent = 0x69,
-    ScriptNetworkEvent = 0x6a,
-    ScriptParseHTML = 0x6b,
-    ScriptPlannedNavigation = 0x6c,
-    ScriptResize = 0x6d,
-    ScriptSetScrollState = 0x6e,
-    ScriptSetViewport = 0x6f,
-    ScriptTimerEvent = 0x70,
-    ScriptStylesheetLoad = 0x71,
-    ScriptUpdateReplacedElement = 0x72,
-    ScriptWebSocketEvent = 0x73,
-    ScriptWorkerEvent = 0x74,
-    ScriptServiceWorkerEvent = 0x75,
-    ScriptParseXML = 0x76,
-    ScriptEnterFullscreen = 0x77,
-    ScriptExitFullscreen = 0x78,
-    ScriptWebVREvent = 0x79,
-    ScriptWorkletEvent = 0x7a,
-    ScriptPerformanceEvent = 0x7b,
-    ScriptHistoryEvent = 0x7c,
-    ScriptPortMessage = 0x7d,
-    ScriptWebGPUMsg = 0x7e,
-    TimeToFirstPaint = 0x80,
-    TimeToFirstContentfulPaint = 0x81,
-    TimeToInteractive = 0x82,
-    IpcReceiver = 0x83,
-    IpcBytesReceiver = 0x84,
+    ScriptFontLoading = 0x68,
+    ScriptImageCacheMsg = 0x69,
+    ScriptInputEvent = 0x6a,
+    ScriptNetworkEvent = 0x6b,
+
+    /// The script thread is parsing HTML, rather than doing other work like evaluating scripts or doing layout.
+    ScriptParseHTML = 0x6c,
+
+    ScriptPlannedNavigation = 0x6d,
+    ScriptResize = 0x6e,
+    ScriptRendering = 0x6f,
+    ScriptSetScrollState = 0x70,
+    ScriptSetViewport = 0x71,
+    ScriptTimerEvent = 0x72,
+    ScriptStylesheetLoad = 0x73,
+    ScriptUpdateReplacedElement = 0x74,
+    ScriptWebSocketEvent = 0x75,
+    ScriptWorkerEvent = 0x76,
+    ScriptServiceWorkerEvent = 0x77,
+
+    /// The script thread is parsing XML, rather than doing other work like evaluating scripts or doing layout.
+    ScriptParseXML = 0x78,
+
+    ScriptEnterFullscreen = 0x79,
+    ScriptExitFullscreen = 0x7a,
+    ScriptWorkletEvent = 0x7b,
+    ScriptGeolocationEvent = 0x7c,
+    ScriptPerformanceEvent = 0x7d,
+    ScriptNavigationAndTraversalEvent = 0x7e,
+    ScriptPortMessage = 0x7f,
+    ScriptWebGPUMsg = 0x80,
+
+    ScriptDatabaseAccessEvent = 0x81,
+
+    /// Web performance metrics.
+    TimeToFirstPaint = 0x90,
+    TimeToFirstContentfulPaint = 0x91,
+    TimeToInteractive = 0x92,
+    TimeToLargestContentfulPaint = 0x93,
+
+    IpcReceiver = 0x94,
+    IpcBytesReceiver = 0x95,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+impl ProfilerCategory {
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            ProfilerCategory::Painting => "Painting",
+            ProfilerCategory::Layout => "Layout",
+            ProfilerCategory::ImageSaving => "ImageSaving",
+            ProfilerCategory::ScriptSpawnPipeline => "ScriptSpawnPipeline",
+            ProfilerCategory::ScriptConstellationMsg => "ScriptConstellationMsg",
+            ProfilerCategory::ScriptDatabaseAccessEvent => "ScriptDatabaseAccessEvent",
+            ProfilerCategory::ScriptDevtoolsMsg => "ScriptDevtoolsMsg",
+            ProfilerCategory::ScriptDocumentEvent => "ScriptDocumentEvent",
+            ProfilerCategory::ScriptEvaluate => "ScriptEvaluate",
+            ProfilerCategory::ScriptEvent => "ScriptEvent",
+            ProfilerCategory::ScriptFileRead => "ScriptFileRead",
+            ProfilerCategory::ScriptFontLoading => "ScriptFontLoading",
+            ProfilerCategory::ScriptGeolocationEvent => "ScriptGeolocationEvent",
+            ProfilerCategory::ScriptImageCacheMsg => "ScriptImageCacheMsg",
+            ProfilerCategory::ScriptInputEvent => "ScriptInputEvent",
+            ProfilerCategory::ScriptNetworkEvent => "ScriptNetworkEvent",
+            ProfilerCategory::ScriptParseHTML => "ScriptParseHTML",
+            ProfilerCategory::ScriptPlannedNavigation => "ScriptPlannedNavigation",
+            ProfilerCategory::ScriptRendering => "ScriptRendering",
+            ProfilerCategory::ScriptResize => "ScriptResize",
+            ProfilerCategory::ScriptSetScrollState => "ScriptSetScrollState",
+            ProfilerCategory::ScriptSetViewport => "ScriptSetViewport",
+            ProfilerCategory::ScriptTimerEvent => "ScriptTimerEvent",
+            ProfilerCategory::ScriptStylesheetLoad => "ScriptStylesheetLoad",
+            ProfilerCategory::ScriptUpdateReplacedElement => "ScriptUpdateReplacedElement",
+            ProfilerCategory::ScriptWebSocketEvent => "ScriptWebSocketEvent",
+            ProfilerCategory::ScriptWorkerEvent => "ScriptWorkerEvent",
+            ProfilerCategory::ScriptServiceWorkerEvent => "ScriptServiceWorkerEvent",
+            ProfilerCategory::ScriptParseXML => "ScriptParseXML",
+            ProfilerCategory::ScriptEnterFullscreen => "ScriptEnterFullscreen",
+            ProfilerCategory::ScriptExitFullscreen => "ScriptExitFullscreen",
+            ProfilerCategory::ScriptWorkletEvent => "ScriptWorkletEvent",
+            ProfilerCategory::ScriptPerformanceEvent => "ScriptPerformanceEvent",
+            ProfilerCategory::ScriptNavigationAndTraversalEvent => {
+                "ScriptNavigationAndTraversalEvent"
+            },
+            ProfilerCategory::ScriptPortMessage => "ScriptPortMessage",
+            ProfilerCategory::ScriptWebGPUMsg => "ScriptWebGPUMsg",
+            ProfilerCategory::TimeToFirstPaint => "TimeToFirstPaint",
+            ProfilerCategory::TimeToFirstContentfulPaint => "TimeToFirstContentfulPaint",
+            ProfilerCategory::TimeToLargestContentfulPaint => "TimeToLargestContentfulPaint",
+            ProfilerCategory::TimeToInteractive => "TimeToInteractive",
+            ProfilerCategory::IpcReceiver => "IpcReceiver",
+            ProfilerCategory::IpcBytesReceiver => "IpcBytesReceiver",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum TimerMetadataFrameType {
     RootWindow,
     IFrame,
@@ -127,40 +188,31 @@ pub enum TimerMetadataReflowType {
     FirstReflow,
 }
 
+#[cfg(feature = "tracing")]
+pub type Span = tracing::Span;
+#[cfg(not(feature = "tracing"))]
+pub type Span = ();
+
 pub fn profile<T, F>(
     category: ProfilerCategory,
     meta: Option<TimerMetadata>,
     profiler_chan: ProfilerChan,
+    #[cfg(feature = "tracing")] span: Span,
+    #[cfg(not(feature = "tracing"))] _span: Span,
     callback: F,
 ) -> T
 where
     F: FnOnce() -> T,
 {
-    if opts::get().debug.signpost {
-        signpost::start(category as u32, &[0, 0, 0, (category as usize) >> 4]);
-    }
-    let start_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let start_time = CrossProcessInstant::now();
+    let val = {
+        #[cfg(feature = "tracing")]
+        let _enter = span.enter();
+        callback()
+    };
+    let end_time = CrossProcessInstant::now();
 
-    let val = callback();
-
-    let end_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    if opts::get().debug.signpost {
-        signpost::end(category as u32, &[0, 0, 0, (category as usize) >> 4]);
-    }
-
-    send_profile_data(
-        category,
-        meta,
-        &profiler_chan,
-        start_time as u64,
-        end_time as u64,
-    );
+    send_profile_data(category, meta, &profiler_chan, start_time, end_time);
     val
 }
 
@@ -168,8 +220,8 @@ pub fn send_profile_data(
     category: ProfilerCategory,
     meta: Option<TimerMetadata>,
     profiler_chan: &ProfilerChan,
-    start_time: u64,
-    end_time: u64,
+    start_time: CrossProcessInstant,
+    end_time: CrossProcessInstant,
 ) {
     profiler_chan.send(ProfilerMsg::Time((category, meta), (start_time, end_time)));
 }

@@ -1,4 +1,4 @@
-from tests.support.asserts import assert_success
+from tests.support.classic.asserts import assert_success
 from tests.support.sync import Poll
 
 from . import opener, window_name
@@ -50,6 +50,20 @@ def test_opens_about_blank_in_new_window(session, inline):
     assert session.url == "about:blank"
 
 
+# The new window's active document is the initial about:blank document, so the
+# first navigation replaces its session history entry instead of appending one.
+# https://html.spec.whatwg.org/#is-initial-about:blank
+def test_first_navigation_replaces_about_blank(session, inline):
+    response = new_window(session, type_hint="window")
+    value = assert_success(response)
+
+    session.window_handle = value["handle"]
+    url = inline("<p>foo")
+    session.url = url
+    assert session.url == url
+    assert session.execute_script("return history.length") == 1
+
+
 def test_sets_no_window_name(session):
     response = new_window(session, type_hint="window")
     value = assert_success(response)
@@ -91,8 +105,9 @@ def test_initial_selection_for_contenteditable(session, inline):
 
     elem = session.find.css("div", all=False)
 
-    wait = Poll(
-        session,
-        timeout=5,
-        message="Initial selection for contenteditable not set")
-    wait.until(lambda _: elem.attribute("_focused") == "true")
+    def assert_initial_selection(s):
+        assert elem.attribute(
+            "_focused") == "true", "Initial selection for contenteditable not set"
+
+    wait = Poll(session, timeout=5)
+    wait.until(assert_initial_selection)

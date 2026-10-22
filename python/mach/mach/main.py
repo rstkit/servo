@@ -18,8 +18,6 @@ import traceback
 import uuid
 from collections.abc import Iterable
 
-from six import string_types
-
 from .base import (
     CommandContext,
     MachError,
@@ -38,17 +36,11 @@ from .logging import LoggingManager
 from .registrar import Registrar
 from .util import setenv
 
-SUGGEST_MACH_BUSTED = r'''
-You can invoke |./mach busted| to check if this issue is already on file. If it
-isn't, please use |./mach busted file| to report it. If |./mach busted| is
-misbehaving, you can also inspect the dependencies of bug 1543241.
-'''.lstrip()
-
 MACH_ERROR = r'''
 The error occurred in mach itself. This is likely a bug in mach itself or a
 fundamental problem with a loaded module.
 
-'''.lstrip() + SUGGEST_MACH_BUSTED
+'''.lstrip()
 
 ERROR_FOOTER = r'''
 If filing a bug, please include the full output of mach, including this error
@@ -62,12 +54,12 @@ The error occurred in the implementation of the invoked mach command.
 
 This should never occur and is likely a bug in the implementation of that
 command.
-'''.lstrip() + SUGGEST_MACH_BUSTED
+'''.lstrip()
 
 MODULE_ERROR = r'''
 The error occurred in code that was called by the mach command. This is either
 a bug in the called code itself or in the way that mach is calling it.
-'''.lstrip() + SUGGEST_MACH_BUSTED
+'''.lstrip()
 
 NO_COMMAND_ERROR = r'''
 It looks like you tried to run mach without a command.
@@ -538,7 +530,7 @@ To see more help for a specific command, run:
 
             machrc, .machrc
         """
-        if isinstance(paths, string_types):
+        if isinstance(paths, str):
             paths = [paths]
 
         valid_names = ('machrc', '.machrc')
@@ -552,7 +544,7 @@ To see more help for a specific command, run:
                 if os.path.isfile(path):
                     return path
 
-        files = map(find_in_dir, self.settings_paths)
+        files = map(find_in_dir, paths)
         files = filter(bool, files)
 
         self.settings.load_files(files)

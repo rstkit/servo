@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use log::warn;
-
-use crate::wgc::global::Global;
+use wgpu_core::global::Global;
 
 /// Polls devices while there is something to poll.
 ///
@@ -42,7 +41,7 @@ pub(crate) struct Poller {
     handle: Option<JoinHandle<()>>,
     /// Lock for device maintain calls (in poll_all_devices and queue_submit)
     ///
-    /// This is workaround for wgpu deadlocks: https://github.com/gfx-rs/wgpu/issues/5572
+    /// This is workaround for wgpu deadlocks: <https://github.com/gfx-rs/wgpu/issues/5572>
     lock: Arc<Mutex<()>>,
 }
 
@@ -86,7 +85,7 @@ impl Poller {
                             while more_work || work.load(Ordering::Acquire) != 0 {
                                 poll_all_devices(&global, &mut more_work, true, &lock);
                             }
-                            std::thread::park(); //TODO: should we use timeout here
+                            std::thread::park(); // TODO: should we use timeout here
                         }
                     })
                     .expect("Spawning thread should not fail"),
@@ -116,7 +115,7 @@ impl Poller {
     }
 
     /// Lock for device maintain calls (in poll_all_devices and queue_submit)
-    pub(crate) fn lock(&self) -> MutexGuard<()> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap()
     }
 }

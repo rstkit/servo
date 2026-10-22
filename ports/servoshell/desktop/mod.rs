@@ -4,16 +4,19 @@
 
 //! Contains files specific to the servoshell app for Desktop systems.
 
+mod accelerated_gl_media;
 pub(crate) mod app;
 pub(crate) mod cli;
-mod egui_glue;
-mod embedder;
-pub(crate) mod events_loop;
+pub(crate) mod dialog;
+pub(crate) mod event_loop;
+#[cfg(feature = "gamepad")]
+pub(crate) mod gamepad;
 pub mod geometry;
-mod headed_window;
+mod gui;
+pub(crate) mod headed_window;
 mod headless_window;
 mod keyutils;
-mod minibrowser;
+mod protocols;
 mod tracing;
-mod webview;
-mod window_trait;
+#[cfg(feature = "webxr")]
+mod webxr;

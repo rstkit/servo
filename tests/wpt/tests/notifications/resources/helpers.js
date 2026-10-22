@@ -4,11 +4,17 @@ function unregisterAllServiceWorker() {
   });
 }
 
-async function getActiveServiceWorker(script) {
+async function prepareActiveServiceWorker(script, options) {
   await unregisterAllServiceWorker();
-  const reg = await navigator.serviceWorker.register(script);
+  const reg = await navigator.serviceWorker.register(script, options);
   add_completion_callback(() => reg.unregister());
   await navigator.serviceWorker.ready;
+  return reg;
+}
+
+async function prepareActiveServiceWorkerForTest(t, script, options) {
+  const reg = await prepareActiveServiceWorker(script, options);
+  t.add_cleanup(() => reg.unregister());
   return reg;
 }
 
@@ -30,7 +36,7 @@ async function trySettingPermission(perm) {
   // Notification.permission.
   const permission = Notification.permission === "default" ? "prompt" : Notification.permission;
   if (permission !== perm) {
-    throw new Error(`Should have the permission ${perm} to continue`);
+    throw new Error(`Should have the permission ${perm} to continue but found ${permission}`);
   }
 }
 

@@ -14,7 +14,7 @@ from .windows import Windows
 __platform__ = None
 
 
-def host_platform():
+def host_platform() -> str:
     os_type = platform.system().lower()
     if os_type == "linux":
         os_type = "unknown-linux-gnu"
@@ -31,7 +31,7 @@ def host_platform():
     return os_type
 
 
-def host_triple():
+def host_triple() -> str:
     os_type = host_platform()
     cpu_type = platform.machine().lower()
     if cpu_type in ["i386", "i486", "i686", "i768", "x86"]:
@@ -40,14 +40,14 @@ def host_triple():
         cpu_type = "x86_64"
     elif cpu_type == "arm":
         cpu_type = "arm"
-    elif cpu_type == "aarch64":
+    elif cpu_type in ["aarch64", "arm64"]:
         cpu_type = "aarch64"
     else:
         cpu_type = "unknown"
     return f"{cpu_type}-{os_type}"
 
 
-def get():
+def get():  # noqa
     # pylint: disable=global-statement
     global __platform__
     if __platform__:
@@ -64,11 +64,18 @@ def get():
         __platform__ = Windows(triple)
     elif "linux-gnu" in triple:
         from .linux import Linux
+
         __platform__ = Linux(triple)
     elif "apple-darwin" in triple:
         from .macos import MacOS
+
         __platform__ = MacOS(triple)
+    elif "unknown-freebsd" in triple:
+        from .freebsd import FreeBSD
+
+        __platform__ = FreeBSD(triple)
     else:
         from .base import Base
+
         __platform__ = Base(triple)
     return __platform__

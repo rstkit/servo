@@ -6,22 +6,30 @@ use cssparser::SourceLocation;
 use euclid::{Scale, Size2D};
 use selectors::parser::{AncestorHashes, Selector};
 use servo_arc::Arc;
-use servo_atoms::Atom;
 use style::context::QuirksMode;
+use style::device::Device;
+use style::device::servo::FontMetricsProvider;
 use style::font_metrics::FontMetrics;
-use style::media_queries::{Device, MediaType};
+use style::media_queries::MediaType;
 use style::properties::style_structs::Font;
-use style::properties::{longhands, Importance, PropertyDeclaration, PropertyDeclarationBlock};
+use style::properties::{
+    ComputedValues, Importance, PropertyDeclaration, PropertyDeclarationBlock, longhands,
+};
+use style::queries::values::PrefersColorScheme;
+use style::rule_tree::{RuleCascadeFlags, StyleSource};
 use style::selector_map::SelectorMap;
 use style::selector_parser::{SelectorImpl, SelectorParser};
-use style::servo::media_queries::FontMetricsProvider;
+use style::servo::media_features::PointerCapabilities;
 use style::shared_lock::SharedRwLock;
 use style::stylesheets::StyleRule;
 use style::stylist::{
-    needs_revalidation_for_testing, ContainerConditionId, LayerId, Rule, ScopeConditionId, Stylist,
+    ContainerConditionId, LayerId, Rule, ScopeConditionId, Stylist, needs_revalidation_for_testing,
 };
 use style::thread_state::{self, ThreadState};
 use style::values::computed::Length;
+use style::values::computed::font::GenericFontFamily;
+use style::values::specified::font::QueryFontMetricsFlags;
+use stylo_atoms::Atom;
 use url::Url;
 
 #[derive(Debug)]
@@ -33,10 +41,12 @@ impl FontMetricsProvider for DummyMetricsProvider {
         _vertical: bool,
         _font: &Font,
         _base_size: Length,
-        _in_media_query: bool,
-        _retrieve_math_scales: bool,
+        _flags: QueryFontMetricsFlags,
     ) -> FontMetrics {
         Default::default()
+    }
+    fn base_size_for_generic(&self, _: GenericFontFamily) -> Length {
+        Length::new(16.)
     }
 }
 
@@ -73,11 +83,11 @@ fn get_mock_rules(css_selectors: &[&str]) -> (Vec<Vec<Rule>>, SharedRwLock) {
                         Rule::new(
                             s.clone(),
                             AncestorHashes::new(s, QuirksMode::NoQuirks),
-                            locked.clone(),
+                            StyleSource::from_declarations(rule.block.clone()),
                             i as u32,
                             LayerId::root(),
                             ContainerConditionId::none(),
-                            /* in_starting_style = */ false,
+                            RuleCascadeFlags::empty(),
                             ScopeConditionId::none(),
                         )
                     })
@@ -157,9 +167,6 @@ fn test_revalidation_selectors() {
     .collect::<Vec<_>>();
 
     let reference = parse_selectors(&[
-        // ID selectors.
-        "#foo3 > span",
-        "#foo1 > span",
         // Attribute selectors.
         "div[foo]",
         "div:not([foo])",
@@ -191,10 +198,7 @@ fn test_revalidation_selectors() {
     .into_iter()
     .collect::<Vec<_>>();
 
-    assert_eq!(test.len(), reference.len());
-    for (t, r) in test.into_iter().zip(reference.into_iter()) {
-        assert_eq!(t, r)
-    }
+    assert_eq!(test, reference);
 }
 
 #[test]
@@ -234,19 +238,27 @@ fn test_insert() {
             .unwrap()[0]
             .source_order
     );
-    assert!(selector_map
-        .class_hash
-        .get(&Atom::from("intro"), QuirksMode::NoQuirks)
-        .is_none());
+    assert!(
+        selector_map
+            .class_hash
+            .get(&Atom::from("intro"), QuirksMode::NoQuirks)
+            .is_none()
+    );
 }
 
 fn mock_stylist() -> Stylist {
+    let initial_style = ComputedValues::initial_values_with_font_override(Font::initial_values());
     let device = Device::new(
         MediaType::screen(),
         QuirksMode::NoQuirks,
         Size2D::new(0f32, 0f32),
+        Size2D::new(0f32, 0f32),
         Scale::new(1.0),
         Box::new(DummyMetricsProvider),
+        initial_style,
+        PrefersColorScheme::Light,
+        PointerCapabilities::default(),
+        PointerCapabilities::default(),
     );
     Stylist::new(device, QuirksMode::NoQuirks)
 }

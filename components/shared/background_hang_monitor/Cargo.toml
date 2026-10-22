@@ -1,10 +1,13 @@
 [package]
-name = "background_hang_monitor_api"
+name = "servo-background-hang-monitor-api"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [lib]
 name = "background_hang_monitor_api"
@@ -13,12 +16,8 @@ test = false
 doctest = false
 
 [dependencies]
-base = { workspace = true }
-ipc-channel = { workspace = true }
-lazy_static = { workspace = true }
-malloc_size_of = { workspace = true }
-malloc_size_of_derive = { workspace = true }
-parking_lot = { workspace = true }
 serde = { workspace = true }
-size_of_test = { workspace = true }
-webrender_api = { workspace = true }
+servo-base = { workspace = true }
+
+[lints]
+workspace = true

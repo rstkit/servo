@@ -7,9 +7,10 @@ import { attemptGarbageCollection } from '../../../../common/util/collect_garbag
 import { assert, unreachable } from '../../../../common/util/util.js';
 import { kBufferUsages } from '../../../capability_info.js';
 import { GPUConst } from '../../../constants.js';
-import { ValidationTest } from '../validation_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../gpu_test.js';
+import * as vtu from '../validation_test_utils.js';
 
-class F extends ValidationTest {
+class F extends AllFeaturesMaxLimitsGPUTest {
   async testMapAsyncCall(
   expectation,
 
@@ -27,8 +28,10 @@ class F extends ValidationTest {
       this.expectValidationError(() => {
         p = buffer.mapAsync(mode, offset, size);
       }, expectation.validationError);
+
       let caught = false;
       let rejectedEarly = false;
+      let microtaskBRan = false;
       // If mapAsync rejected early, microtask A will run before B.
       // If not, B will run before A.
       p.catch(() => {
@@ -38,20 +41,31 @@ class F extends ValidationTest {
       queueMicrotask(() => {
         // Microtask B
         rejectedEarly = caught;
+        microtaskBRan = true;
       });
-      try {
-        // This await will always complete after microtasks A and B are both done.
-        await p;
-        assert(expectation.rejectName === null, 'mapAsync unexpectedly passed');
-      } catch (ex) {
-        assert(ex instanceof Error, 'mapAsync rejected with non-error');
-        assert(typeof ex.stack === 'string', 'mapAsync rejected without a stack');
-        assert(expectation.rejectName === ex.name, `mapAsync rejected unexpectedly with: ${ex}`);
-        assert(
-          expectation.earlyRejection === rejectedEarly,
-          'mapAsync rejected at an unexpected timing'
-        );
-      }
+
+      // These handlers should always run after microtasks A and B are both done.
+      await p.then(
+        () => {
+          unreachable('mapAsync unexpectedly passed');
+        },
+        (ex) => {
+          const suffix = `\n  Rejection: ${ex}`;
+
+          this.expect(microtaskBRan, 'scheduling problem?: microtaskB has not run yet' + suffix);
+          assert(ex instanceof Error, 'mapAsync rejected with non-error' + suffix);
+          this.expect(typeof ex.stack === 'string', 'mapAsync rejected without a stack' + suffix);
+          this.expect(
+            expectation.rejectName === ex.name,
+            'mapAsync rejected with wrong exception name' + suffix
+          );
+          if (expectation.earlyRejection) {
+            this.expect(rejectedEarly, 'expected early mapAsync rejection, got deferred' + suffix);
+          } else {
+            this.expect(!rejectedEarly, 'expected deferred mapAsync rejection, got early' + suffix);
+          }
+        }
+      );
     }
   }
 
@@ -72,12 +86,12 @@ class F extends ValidationTest {
   createMappableBuffer(type, size) {
     switch (type) {
       case GPUMapMode.READ:
-        return this.device.createBuffer({
+        return this.createBufferTracked({
           size,
           usage: GPUBufferUsage.MAP_READ
         });
       case GPUMapMode.WRITE:
-        return this.device.createBuffer({
+        return this.createBufferTracked({
           size,
           usage: GPUBufferUsage.MAP_WRITE
         });
@@ -115,7 +129,7 @@ combine('usage', kBufferUsages)
 fn(async (t) => {
   const { mapMode, validUsage, usage } = t.params;
 
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: 16,
     usage
   });
@@ -136,7 +150,7 @@ desc('Test that mapAsync is an error when called on an invalid buffer.').
 paramsSubcasesOnly((u) => u.combine('mapMode', kMapModeOptions)).
 fn(async (t) => {
   const { mapMode } = t.params;
-  const buffer = t.getErrorBuffer();
+  const buffer = vtu.getErrorBuffer(t);
   await t.testMapAsyncCall(
     { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
     buffer,
@@ -181,13 +195,13 @@ paramsSubcasesOnly([
 fn(async (t) => {
   const { mapMode, validUsage } = t.params;
 
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: 16,
     usage: validUsage,
     mappedAtCreation: true
   });
   await t.testMapAsyncCall(
-    { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -208,7 +222,7 @@ fn(async (t) => {
   const buffer = t.createMappableBuffer(mapMode, 16);
   await t.testMapAsyncCall('success', buffer, mapMode);
   await t.testMapAsyncCall(
-    { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -240,7 +254,7 @@ fn(async (t) => {
   // that we can unmap the previous mapping in the same stack frame and testing this one doesn't
   // get canceled, but instead is rejected.
   const pending1 = t.testMapAsyncCall(
-    { validationError: false, earlyRejection: true, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -378,7 +392,7 @@ fn(async (t) => {
   const p1 = buffer.mapAsync(mapMode, offset1, mapSize); // succeeds
   await t.testMapAsyncCall(
     {
-      validationError: false,
+      validationError: true,
       earlyRejection: true,
       rejectName: 'OperationError'
     },
@@ -391,20 +405,17 @@ fn(async (t) => {
 });
 
 g.test('mapAsync,abort_over_invalid_error').
-desc(
-  `Test that unmap abort error should have precedence over validation error
-TODO
-  - Add other validation error test (eg. offset is not a multiple of 8)
-  `
-).
+desc('Test that unmap abort error should have precedence over validation error').
 paramsSubcasesOnly((u) =>
 u.combine('mapMode', kMapModeOptions).combine('unmapBeforeResolve', [true, false])
 ).
 fn(async (t) => {
   const { mapMode, unmapBeforeResolve } = t.params;
   const bufferSize = 8;
-  const buffer = t.createMappableBuffer(mapMode, bufferSize);
-  await buffer.mapAsync(mapMode);
+  const buffer = t.createBufferTracked({
+    usage: GPUBufferUsage.STORAGE,
+    size: bufferSize
+  });
 
   if (unmapBeforeResolve) {
     // unmap abort error should have precedence over validation error
@@ -416,7 +427,7 @@ fn(async (t) => {
     buffer.unmap();
     await pending;
   } else {
-    // map on already mapped buffer should cause validation error
+    // invalid map call should cause validation error
     await t.testMapAsyncCall(
       { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
       buffer,
@@ -441,7 +452,7 @@ fn(async (t) => {
 
   // map on already mapped buffer should be rejected
   const pending = t.testMapAsyncCall(
-    { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -464,7 +475,7 @@ u.combine('bufferUsage', kBufferUsages).combine('mapMode', kMapModeOptions)
 fn(async (t) => {
   const { bufferUsage, mapMode } = t.params;
   const bufferSize = 16;
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     usage: bufferUsage,
     size: bufferSize,
     mappedAtCreation: true
@@ -476,7 +487,7 @@ fn(async (t) => {
 
   // map on already mapped buffer should be rejected
   const pending = t.testMapAsyncCall(
-    { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -496,7 +507,7 @@ so the Content process doesn't necessarily know the buffer is invalid.`
 ).
 fn((t) => {
   const buffer = t.expectGPUError('validation', () =>
-  t.device.createBuffer({
+  t.createBufferTracked({
     mappedAtCreation: true,
     size: 16,
     usage: 0xffff_ffff // Invalid usage
@@ -519,7 +530,7 @@ fn(async (t) => {
 
   // call mapAsync again on already mapped buffer should fail
   await t.testMapAsyncCall(
-    { validationError: true, earlyRejection: false, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -550,7 +561,7 @@ fn(async (t) => {
 
   // It is invalid to call getMappedRange when the buffer is unmapped after mappedAtCreation.
   {
-    const buffer = t.device.createBuffer({
+    const buffer = t.createBufferTracked({
       usage: GPUBufferUsage.MAP_READ,
       size: 16,
       mappedAtCreation: true
@@ -597,7 +608,7 @@ fn(async (t) => {
   const bufferSize = 16;
   const offset = 8;
   const subrangeSize = bufferSize - offset;
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: bufferSize,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     mappedAtCreation: true
@@ -640,7 +651,7 @@ fn(async (t) => {
 
   // It is invalid to call getMappedRange when the buffer is destroyed when mapped at creation.
   {
-    const buffer = t.device.createBuffer({
+    const buffer = t.createBufferTracked({
       usage: GPUBufferUsage.MAP_READ,
       size: 16,
       mappedAtCreation: true
@@ -660,7 +671,7 @@ fn(async (t) => {
   /* noawait */const mapping0 = buffer.mapAsync(mapMode);
   // seconding mapping should be rejected
   const mapping1 = t.testMapAsyncCall(
-    { validationError: false, earlyRejection: true, rejectName: 'OperationError' },
+    { validationError: true, earlyRejection: true, rejectName: 'OperationError' },
     buffer,
     mapMode
   );
@@ -704,7 +715,7 @@ combine('size', [0, kSizeAlignment, kSizeAlignment / 2])
 ).
 fn((t) => {
   const { offset, size } = t.params;
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: 16,
     usage: GPUBufferUsage.COPY_DST,
     mappedAtCreation: true
@@ -750,7 +761,7 @@ paramsSubcasesOnly([
 ).
 fn((t) => {
   const { bufferSize, offset, size } = t.params;
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: bufferSize,
     usage: GPUBufferUsage.COPY_DST,
     mappedAtCreation: true
@@ -912,7 +923,7 @@ combineWithParams([
 ).
 fn(async (t) => {
   const { offset1, size1, offset2, size2, remapBetweenCalls } = t.params;
-  const buffer = t.device.createBuffer({ size: 80, usage: GPUBufferUsage.MAP_READ });
+  const buffer = t.createBufferTracked({ size: 80, usage: GPUBufferUsage.MAP_READ });
   await buffer.mapAsync(GPUMapMode.READ);
 
   t.testGetMappedRangeCall(true, buffer, offset1, size1);
@@ -930,13 +941,13 @@ fn(async (t) => {
   t.testGetMappedRangeCall(success, buffer, offset2, size2);
 });
 
-g.test('getMappedRange,disjoinRanges_many').
+g.test('getMappedRange,disjointRanges_many').
 desc('Test getting a lot of small ranges, and that the disjoint check checks them all.').
 fn(async (t) => {
   const kStride = 256;
   const kNumStrides = 256;
 
-  const buffer = t.device.createBuffer({
+  const buffer = t.createBufferTracked({
     size: kStride * kNumStrides,
     usage: GPUBufferUsage.MAP_READ
   });
@@ -963,7 +974,7 @@ desc(
 fn(async (t) => {
   // It is valid to call unmap after creation of an unmapped buffer.
   {
-    const buffer = t.device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ });
+    const buffer = t.createBufferTracked({ size: 16, usage: GPUBufferUsage.MAP_READ });
     buffer.unmap();
   }
 
@@ -977,7 +988,7 @@ fn(async (t) => {
 
   // It is valid to call unmap after unmapping a mappedAtCreation buffer.
   {
-    const buffer = t.device.createBuffer({
+    const buffer = t.createBufferTracked({
       usage: GPUBufferUsage.MAP_READ,
       size: 16,
       mappedAtCreation: true
@@ -995,7 +1006,7 @@ desc(
 fn(async (t) => {
   // It is valid to call unmap after destruction of an unmapped buffer.
   {
-    const buffer = t.device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ });
+    const buffer = t.createBufferTracked({ size: 16, usage: GPUBufferUsage.MAP_READ });
     buffer.destroy();
     buffer.unmap();
   }
@@ -1010,7 +1021,7 @@ fn(async (t) => {
 
   // It is valid to call unmap after destroying a mappedAtCreation buffer.
   {
-    const buffer = t.device.createBuffer({
+    const buffer = t.createBufferTracked({
       usage: GPUBufferUsage.MAP_READ,
       size: 16,
       mappedAtCreation: true
@@ -1028,7 +1039,7 @@ u //
 ).
 fn((t) => {
   const { bufferUsage } = t.params;
-  const buffer = t.device.createBuffer({ size: 16, usage: bufferUsage, mappedAtCreation: true });
+  const buffer = t.createBufferTracked({ size: 16, usage: bufferUsage, mappedAtCreation: true });
 
   buffer.unmap();
 });
@@ -1066,7 +1077,7 @@ desc(
 ).
 fn(async (t) => {
   let buffer = null;
-  buffer = t.device.createBuffer({
+  buffer = t.createBufferTracked({
     size: 256,
     usage: GPUBufferUsage.COPY_DST,
     mappedAtCreation: true

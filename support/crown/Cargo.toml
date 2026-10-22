@@ -7,14 +7,14 @@ license = "MPL-2.0"
 publish = false
 
 # Do not use workspace dependencies in this package!
-# In etc/shell.nix, we filter Cargo.lock and build this package in isolation,
-# so it needs to make sense without the workspace manifest.
+# crown is not part of the Cargo workspace.
 [dev-dependencies]
 compiletest_rs = { version = "0.11", features = ["tmp"] }
-once_cell = "1"
 
 [features]
-default = ["unrooted_must_root_lint", "trace_in_no_trace_lint"]
+default = ["jscontext_first_arg", "manual_domstring_new", "unrooted_must_root_lint", "trace_in_no_trace_lint"]
+jscontext_first_arg = []
+manual_domstring_new = []
 unrooted_must_root_lint = []
 trace_in_no_trace_lint = []
 
